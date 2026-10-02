@@ -10,7 +10,7 @@ echo "=== Установка зависимостей ==="
 pkg install -y python nodejs-lts git openssh termux-api
 
 echo "=== Python пакеты ==="
-pip install --upgrade pip
+pkg install python-pip -y
 pip install python-telegram-bot==21.0.1 python-dotenv==1.0.1
 
 echo "=== Codex CLI ==="
