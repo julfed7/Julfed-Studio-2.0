@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.request
 import urllib.error
 import zipfile
@@ -45,9 +46,10 @@ SEND_EXTS = {
 }
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 TEXT_PROMPT_EXTS = {".txt", ".md", ".gd", ".py", ".json", ".cfg", ".ini", ".tscn", ".tres"}
 
-MAX_FILE_SIZE = 20 * 1024 * 1024  # Telegram limit
+MAX_FILE_SIZE = 20 * 1024 * 1024
 
 
 def log(msg: str) -> None:
@@ -57,16 +59,65 @@ def log(msg: str) -> None:
 # ============ GIT ============
 
 def git_commit_push(message: str) -> tuple:
+    """Git add + commit + push с retry и авто-pull."""
     try:
-        subprocess.run(["git", "add", "-A"], cwd=str(PROJECT_PATH),
-                       capture_output=True, text=True, timeout=60)
-        r1 = subprocess.run(["git", "commit", "-m", message], cwd=str(PROJECT_PATH),
-                            capture_output=True, text=True, timeout=60)
-        if r1.returncode != 0 and "nothing to commit" in (r1.stdout + r1.stderr):
+        # git add
+        r0 = subprocess.run(
+            ["git", "add", "-A"],
+            cwd=str(PROJECT_PATH),
+            capture_output=True, text=True, timeout=120,
+        )
+        log(f"[git add] rc={r0.returncode}")
+        if r0.returncode != 0:
+            log(f"[git add] stderr: {(r0.stderr or '')[-300:]}")
+
+        # git commit
+        r1 = subprocess.run(
+            ["git", "commit", "-m", message],
+            cwd=str(PROJECT_PATH),
+            capture_output=True, text=True, timeout=120,
+        )
+        combined1 = (r1.stdout or "") + (r1.stderr or "")
+        log(f"[git commit] rc={r1.returncode}")
+        log(f"[git commit] {combined1[-300:]}")
+
+        if r1.returncode != 0 and "nothing to commit" in combined1.lower():
             return (True, "nothing to commit")
-        r = subprocess.run(["git", "push"], cwd=str(PROJECT_PATH),
-                           capture_output=True, text=True, timeout=180)
-        return (r.returncode == 0, r.stdout + r.stderr)
+
+        # git push — 3 попытки
+        for attempt in range(3):
+            log(f"[git push] попытка {attempt + 1}/3...")
+            try:
+                r = subprocess.run(
+                    ["git", "push"],
+                    cwd=str(PROJECT_PATH),
+                    capture_output=True, text=True, timeout=900,
+                )
+                combined = (r.stdout or "") + (r.stderr or "")
+                log(f"[git push] rc={r.returncode}")
+                log(f"[git push] {combined[-500:]}")
+
+                if r.returncode == 0:
+                    return (True, combined)
+
+                # Конфликт — pull и повторить
+                if "rejected" in combined.lower() or "non-fast-forward" in combined.lower():
+                    log("[git push] конфликт, делаю pull --rebase...")
+                    subprocess.run(
+                        ["git", "pull", "--rebase", "--no-edit"],
+                        cwd=str(PROJECT_PATH),
+                        capture_output=True, text=True, timeout=300,
+                    )
+            except subprocess.TimeoutExpired:
+                log(f"[git push] таймаут попытки {attempt + 1}")
+            except Exception as e:
+                log(f"[git push] ошибка: {e}")
+
+            if attempt < 2:
+                time.sleep(10)
+
+        return (False, "git push failed after 3 attempts")
+
     except Exception as e:
         return (False, str(e))
 
@@ -109,7 +160,6 @@ def get_latest_release_tag(repo: str, token: str) -> str:
 
 
 def wait_for_new_release(repo: str, token: str, prev_tag: str, timeout_sec: int = 900) -> str:
-    import time
     start = time.time()
     while time.time() - start < timeout_sec:
         tag = get_latest_release_tag(repo, token)
@@ -223,7 +273,7 @@ def generate_next_task() -> str:
 СДЕЛАНО:
 {recent}
 
-Придумай ОДНУ конкретную задачу под направление. Ответь РОВНО одной строкой без кавычек и пояснений."""
+Придумай ОДНУ конкретную задачу под направление. Ответь РОВНО одной строкой без кавычек."""
 
     try:
         r = run_codex_only(meta, None)
@@ -407,7 +457,6 @@ def _run_codex(prompt: str, image_paths: list = None) -> dict:
         "--config", f'model_reasoning_effort="{effort}"',
     ]
 
-    # Изображения — через --image
     if image_paths:
         for img in image_paths:
             if Path(img).exists():
@@ -416,6 +465,7 @@ def _run_codex(prompt: str, image_paths: list = None) -> dict:
     cmd.append(prompt)
 
     log(f"run_codex: {' '.join(cmd[:8])} ...")
+    log(f"run_codex: images = {len(image_paths) if image_paths else 0}")
 
     try:
         r = subprocess.run(
@@ -429,7 +479,7 @@ def _run_codex(prompt: str, image_paths: list = None) -> dict:
         return {"answer": f"❌ {e}", "tokens": 0, "ok": False, "files": []}
 
     if r.returncode != 0:
-        return {"answer": f"❌ код {r.returncode}\n{r.stderr[-500:]}",
+        return {"answer": f"❌ код {r.returncode}\n{(r.stderr or '')[-500:]}",
                 "tokens": 0, "ok": False, "files": []}
 
     return {
@@ -460,10 +510,12 @@ async def download_attachment_async(file_obj, custom_name: str = None) -> Path:
 
 
 def classify_attachment(name: str) -> str:
-    """Возвращает: 'image', 'text_prompt', 'zip', 'other'."""
+    """Возвращает: 'image', 'video', 'text_prompt', 'zip', 'other'."""
     ext = Path(name).suffix.lower()
     if ext in IMAGE_EXTS:
         return "image"
+    if ext in VIDEO_EXTS:
+        return "video"
     if ext == ".zip":
         return "zip"
     if ext in TEXT_PROMPT_EXTS:
