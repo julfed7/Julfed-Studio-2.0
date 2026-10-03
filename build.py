@@ -127,12 +127,27 @@ def git_commit_push(message: str) -> tuple:
         for attempt in range(3):
             log(f"[git push] попытка {attempt + 1}/3...")
             try:
+                gh_repo = os.getenv("GITHUB_REPO", "")
+                gh_token = os.getenv("GITHUB_TOKEN", "")
+                if gh_repo and gh_token:
+                    push_cmd = [
+                        "git", "-c", "credential.helper=", "push",
+                        f"https://x-access-token:{gh_token}@github.com/{gh_repo}.git",
+                        "HEAD",
+                    ]
+                else:
+                    push_cmd = ["git", "push"]
                 r = subprocess.run(
-                    ["git", "push"],
+                    push_cmd,
                     cwd=str(PROJECT_PATH),
-                    capture_output=True, text=True, timeout=900,
+                    capture_output=True, text=True, timeout=180,
+                    stdin=subprocess.DEVNULL,
+                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
                 )
-                combined = (r.stdout or "") + (r.stderr or "")
+                combined_safe = (r.stdout or "") + (r.stderr or "")
+                if gh_token:
+                    combined_safe = combined_safe.replace(gh_token, "***")
+                combined = combined_safe
                 log(f"[git push] rc={r.returncode}")
                 log(f"[git push] {combined[-500:]}")
 
@@ -141,11 +156,36 @@ def git_commit_push(message: str) -> tuple:
 
                 if "rejected" in combined.lower() or "non-fast-forward" in combined.lower():
                     log("[git push] конфликт, pull --rebase...")
-                    subprocess.run(
-                        ["git", "pull", "--rebase", "--no-edit"],
+                    if gh_repo and gh_token:
+                        br = subprocess.run(
+                            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                            cwd=str(PROJECT_PATH),
+                            capture_output=True, text=True, timeout=30,
+                        ).stdout.strip() or "main"
+                        pull_cmd = [
+                            "git", "-c", "credential.helper=", "pull", "--rebase", "--no-edit",
+                            f"https://x-access-token:{gh_token}@github.com/{gh_repo}.git", br,
+                        ]
+                    else:
+                        pull_cmd = ["git", "pull", "--rebase", "--no-edit"]
+                    pr = subprocess.run(
+                        pull_cmd,
                         cwd=str(PROJECT_PATH),
                         capture_output=True, text=True, timeout=300,
+                        stdin=subprocess.DEVNULL,
+                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
                     )
+                    pr_out = (pr.stdout or "") + (pr.stderr or "")
+                    if gh_token:
+                        pr_out = pr_out.replace(gh_token, "***")
+                    log(f"[git pull] rc={pr.returncode} {pr_out[-300:]}")
+                    if pr.returncode != 0:
+                        subprocess.run(
+                            ["git", "rebase", "--abort"],
+                            cwd=str(PROJECT_PATH),
+                            capture_output=True, text=True, timeout=30,
+                        )
+                        return (False, "Конфликт при pull --rebase, нужно решить вручную:\n" + pr_out[-300:])
             except subprocess.TimeoutExpired:
                 log(f"[git push] таймаут {attempt + 1}")
             except Exception as e:
