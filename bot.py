@@ -4,9 +4,10 @@ import os
 import tempfile
 from pathlib import Path
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -28,6 +29,7 @@ from build import (
     add_to_history,
     git_commit_push, ensure_git_config,
     download_latest_apk, get_latest_release_tag, wait_for_new_release,
+    get_usage_summary, get_codex_limits, write_credits_snapshot, reset_credit_period,
     trigger_build_workflow,
     PROJECT_PATH,
 )
@@ -123,7 +125,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• .txt .md .gd → промпт\n"
         "• фото / видео → Codex\n"
         "• .zip → замена проекта\n\n"
-        "<b>Прочее:</b> <code>/model</code>, <code>/status</code>, <code>/cancel</code>"
+        "<b>Прочее:</b> <code>/model</code>, <code>/credits</code>, <code>/limit5h</code>, <code>/credits_limit</code>, <code>/credits_reset</code>, <code>/status</code>, <code>/cancel</code>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -139,6 +141,33 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ============ МОДЕЛЬ ============
 
+DEFAULT_MODELS = ["gpt-5.6-luna", "gpt-5.6-sol"]
+EFFORTS = ["low", "medium", "high"]
+
+
+def _model_keyboard() -> InlineKeyboardMarkup:
+    from config import CONFIG
+    cur_m = CONFIG.get("model", "gpt-5.6-luna")
+    cur_e = CONFIG.get("effort", "high")
+    models = list(CONFIG.get("models", DEFAULT_MODELS))
+    if cur_m not in models:
+        models.insert(0, cur_m)
+    rows = [[InlineKeyboardButton(("✅ " if m == cur_m else "") + m, callback_data=f"model:{m}")]
+            for m in models]
+    rows.append([InlineKeyboardButton(("✅ " if e == cur_e else "") + e, callback_data=f"effort:{e}")
+                 for e in EFFORTS])
+    return InlineKeyboardMarkup(rows)
+
+
+def _model_text() -> str:
+    from config import CONFIG
+    return (
+        f"🤖 Модель: <code>{CONFIG.get('model', 'gpt-5.6-luna')}</code>\n"
+        f"⚙️ Усилие: <code>{CONFIG.get('effort', 'high')}</code>\n\n"
+        "Выбери кнопкой или напиши: <code>/model &lt;имя&gt; [low|medium|high]</code>"
+    )
+
+
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from config import CONFIG, save_config
     user_id = update.effective_user.id
@@ -149,21 +178,173 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not args:
         await update.message.reply_text(
-            f"🤖 <code>{CONFIG.get('model', 'gpt-5.6-luna')}</code>\n"
-            f"⚙️ <code>{CONFIG.get('effort', 'high')}</code>\n\n"
-            f"Сменить: <code>/model gpt-5.6-sol</code>",
-            parse_mode="HTML",
+            _model_text(), parse_mode="HTML", reply_markup=_model_keyboard()
         )
         return
 
     CONFIG["model"] = args[0]
     if len(args) >= 2:
         CONFIG["effort"] = args[1]
+    models = CONFIG.setdefault("models", list(DEFAULT_MODELS))
+    if args[0] not in models:
+        models.append(args[0])
     save_config(CONFIG)
     await update.message.reply_text(
         f"✅ <code>{CONFIG['model']}</code> / <code>{CONFIG.get('effort', 'high')}</code>",
         parse_mode="HTML",
     )
+
+
+async def cb_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from config import CONFIG, save_config
+    q = update.callback_query
+    kind, _, value = (q.data or "").partition(":")
+    if kind == "model" and value:
+        CONFIG["model"] = value
+    elif kind == "effort" and value in EFFORTS:
+        CONFIG["effort"] = value
+    else:
+        await q.answer()
+        return
+    save_config(CONFIG)
+    await q.answer("Сохранено")
+    try:
+        await q.edit_message_text(
+            _model_text(), parse_mode="HTML", reply_markup=_model_keyboard()
+        )
+    except Exception:
+        pass
+
+
+# ============ КРЕДИТЫ / ЛИМИТЫ ============
+
+def _fmt_reset(rl: dict) -> str:
+    secs = rl.get("resets_in_seconds")
+    if secs is None:
+        return ""
+    secs = int(secs)
+    h, m = secs // 3600, (secs % 3600) // 60
+    return f", сброс через {h} ч {m} мин" if h else f", сброс через {m} мин"
+
+
+def _bar(percent: float, width: int = 10) -> str:
+    filled = max(0, min(width, round(percent / 100 * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _n(x: int) -> str:
+    return f"{int(x):,}".replace(",", " ")
+
+
+async def cmd_credits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from config import CONFIG
+    u = write_credits_snapshot()
+    lines = [
+        "💳 <b>Расход кредитов</b>\n",
+        f"🤖 Модель: <code>{CONFIG.get('model', '?')}</code>",
+    ]
+    # --- 5-часовое окно ---
+    lines.append("\n<b>⏱ 5 часов</b>")
+    if u["w5_limit"] > 0:
+        p5 = u["w5_percent_used"] or 0.0
+        lines.append(f"<b>{_bar(p5)} {p5:.1f}%</b>")
+        lines.append(f"Потрачено: <b>{_n(u['w5_used'])}</b> из {_n(u['w5_limit'])}")
+        lines.append(f"Осталось: <b>{_n(u['w5_remaining'])}</b> ({u['w5_percent_left']:.1f}%)")
+    else:
+        lines.append(f"Потрачено в окне: <b>{_n(u['w5_used'])}</b>")
+        lines.append("Лимит не задан: <code>/limit5h 500000</code>")
+    if u["w5_active"]:
+        lines.append(f"Сброс окна{_fmt_reset({'resets_in_seconds': u['w5_resets_in']})[1:]}")
+    else:
+        lines.append("Окно не активно, оно начнётся с ближайшей задачи")
+
+    lines.append("\n<b>📅 Период подписки</b>")
+    if u["limit"] > 0:
+        pct = u["percent_used"] or 0.0
+        lines += [
+            f"\n<b>{_bar(pct)} {pct:.1f}%</b>",
+            f"Потрачено: <b>{_n(u['period_spent'])}</b> из {_n(u['limit'])}",
+            f"Осталось: <b>{_n(u['remaining'])}</b> ({u['percent_left']:.1f}%)",
+        ]
+        if u["period_start"]:
+            lines.append(f"С: {u['period_start']}")
+    else:
+        lines += [
+            f"\nПотрачено с начала учёта: <b>{_n(u['period_spent'])}</b>",
+            "Максимум не задан. Укажи его: <code>/credits_limit 5000000</code>",
+        ]
+    lines += [
+        f"\n🔢 Сегодня: {_n(u['today'])} | Всего: {_n(u['total'])} ({u['runs']} запусков)",
+    ]
+    if u["by_model"]:
+        lines.append("\n<b>По моделям:</b>")
+        for m, t in sorted(u["by_model"].items(), key=lambda x: -x[1]):
+            lines.append(f"• <code>{m}</code>: {_n(t)}")
+
+    lim = get_codex_limits()
+    rl = lim.get("limits") if lim else None
+    if rl:
+        lines.append("\n<b>Лимиты подписки (по данным Codex):</b>")
+        for key, title in (("primary", "5 часов (Codex)"), ("secondary", "Недельное окно")):
+            w = rl.get(key)
+            if isinstance(w, dict) and w.get("used_percent") is not None:
+                used = float(w["used_percent"])
+                lines.append(f"• {title}: {used:.0f}% использовано, осталось {100 - used:.0f}%{_fmt_reset(w)}")
+    lines.append("\n💾 Отчёт сохранён: <code>credits_report.json</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_credits_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from config import CONFIG, save_config
+    args = context.args or []
+    if not args:
+        cur = int(CONFIG.get("credit_limit", 0) or 0)
+        await update.message.reply_text(
+            f"Максимум сейчас: <b>{_n(cur) if cur else 'не задан'}</b>\n"
+            "Задать: <code>/credits_limit 5000000</code> (в токенах)",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        value = int(args[0].replace("_", "").replace(" ", "").replace(",", ""))
+        if value <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Нужно положительное число, например /credits_limit 5000000")
+        return
+    CONFIG["credit_limit"] = value
+    save_config(CONFIG)
+    write_credits_snapshot()
+    await update.message.reply_text(f"✅ Максимум: <b>{_n(value)}</b> токенов", parse_mode="HTML")
+
+
+async def cmd_limit5h(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from config import CONFIG, save_config
+    args = context.args or []
+    if not args:
+        cur = int(CONFIG.get("limit_5h", 0) or 0)
+        await update.message.reply_text(
+            f"5-часовой лимит: <b>{_n(cur) if cur else 'не задан'}</b>\n"
+            "Задать: <code>/limit5h 500000</code> (в токенах)",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        value = int(args[0].replace("_", "").replace(" ", "").replace(",", ""))
+        if value <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Нужно положительное число, например /limit5h 500000")
+        return
+    CONFIG["limit_5h"] = value
+    save_config(CONFIG)
+    write_credits_snapshot()
+    await update.message.reply_text(f"✅ 5-часовой лимит: <b>{_n(value)}</b> токенов", parse_mode="HTML")
+
+
+async def cmd_credits_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    reset_credit_period()
+    await update.message.reply_text("♻️ Счётчик потраченного сброшен (новый период).")
 
 
 # ============ СТАТУС ============
@@ -894,6 +1075,11 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("credits", cmd_credits))
+    app.add_handler(CommandHandler("credits_limit", cmd_credits_limit))
+    app.add_handler(CommandHandler("credits_reset", cmd_credits_reset))
+    app.add_handler(CommandHandler("limit5h", cmd_limit5h))
+    app.add_handler(CallbackQueryHandler(cb_model, pattern=r"^(model|effort):"))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 

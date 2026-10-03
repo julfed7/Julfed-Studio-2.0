@@ -209,39 +209,69 @@ def _gh_request(url: str, token: str) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _apk_asset(release: dict):
+    for asset in release.get("assets", []) or []:
+        if asset.get("name", "").endswith(".apk"):
+            return asset
+    return None
+
+
+def _latest_releases(repo: str, token: str) -> list:
+    try:
+        data = _gh_request(f"https://api.github.com/repos/{repo}/releases?per_page=10", token)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log(f"[GH] не удалось получить релизы: {e}")
+        return []
+
+
 def download_latest_apk(repo: str, token: str, out_path: Path) -> bool:
     try:
-        releases = _gh_request(f"https://api.github.com/repos/{repo}/releases", token)
-        if not releases:
-            return False
-        latest = releases[0]
-        for asset in latest.get("assets", []):
-            if asset["name"].endswith(".apk"):
-                req = urllib.request.Request(asset["browser_download_url"])
-                req.add_header("Authorization", f"token {token}")
-                with urllib.request.urlopen(req, timeout=180) as resp:
-                    out_path.write_bytes(resp.read())
-                return True
+        releases = _latest_releases(repo, token)
+        for rel in releases:
+            asset = _apk_asset(rel)
+            if not asset:
+                continue
+            req = urllib.request.Request(asset["url"])
+            req.add_header("Authorization", f"token {token}")
+            req.add_header("Accept", "application/octet-stream")
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                out_path.write_bytes(resp.read())
+            return True
+        log("[GH] ни в одном релизе нет .apk")
         return False
     except Exception as e:
-        log(f"[GH] ошибка: {e}")
+        log(f"[GH] ошибка скачивания APK: {e}")
         return False
 
 
 def get_latest_release_tag(repo: str, token: str) -> str:
+    releases = _latest_releases(repo, token)
+    return releases[0]["tag_name"] if releases else ""
+
+
+def _parse_gh_time(value: str) -> float:
     try:
-        releases = _gh_request(f"https://api.github.com/repos/{repo}/releases", token)
-        return releases[0]["tag_name"] if releases else ""
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=__import__("datetime").timezone.utc
+        ).timestamp()
     except Exception:
-        return ""
+        return 0.0
 
 
 def wait_for_new_release(repo: str, token: str, prev_tag: str, timeout_sec: int = 900) -> str:
     start = time.time()
     while time.time() - start < timeout_sec:
-        tag = get_latest_release_tag(repo, token)
-        if tag and tag != prev_tag:
-            return tag
+        for rel in _latest_releases(repo, token):
+            if rel.get("draft"):
+                continue
+            if not _apk_asset(rel):
+                continue
+            tag = rel.get("tag_name", "")
+            published = _parse_gh_time(rel.get("published_at") or rel.get("created_at") or "")
+            if tag != prev_tag or published >= start - 120:
+                log(f"[GH] найден релиз {tag} с APK")
+                return tag
         time.sleep(20)
     return ""
 
@@ -514,6 +544,143 @@ def _extract_tokens(raw: str) -> int:
     return int(d) if d else 0
 
 
+# ============ ЛИМИТЫ / РАСХОД ============
+
+USAGE_FILE = Path(__file__).parent / "usage_stats.json"
+CREDITS_FILE = Path(__file__).parent / "credits_report.json"
+
+
+def _load_usage() -> dict:
+    try:
+        return json.loads(USAGE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"total": 0, "runs": 0, "by_model": {}, "by_day": {}}
+
+
+def record_usage(model: str, tokens: int) -> None:
+    if tokens <= 0:
+        return
+    try:
+        u = _load_usage()
+        day = datetime.now().strftime("%Y-%m-%d")
+        u["total"] = u.get("total", 0) + tokens
+        u["period_spent"] = u.get("period_spent", 0) + tokens
+        u.setdefault("period_start", datetime.now().strftime("%Y-%m-%d %H:%M"))
+        u["runs"] = u.get("runs", 0) + 1
+        now_ts = time.time()
+        ev = u.setdefault("events", [])
+        ev.append({"t": now_ts, "tokens": tokens, "model": model})
+        u["events"] = [e for e in ev if now_ts - e.get("t", 0) < 8 * 86400]
+        u.setdefault("by_model", {})[model] = u.setdefault("by_model", {}).get(model, 0) + tokens
+        u.setdefault("by_day", {})[day] = u.setdefault("by_day", {}).get(day, 0) + tokens
+        # храним только последние 14 дней
+        for d in sorted(u["by_day"])[:-14]:
+            u["by_day"].pop(d, None)
+        USAGE_FILE.write_text(json.dumps(u, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_credits_snapshot()
+    except Exception as e:
+        log(f"[usage] не удалось записать: {e}")
+
+
+WINDOW_5H = 5 * 3600
+
+
+def get_5h_window() -> dict:
+    """Текущее 5-часовое окно: начинается с первого запуска после окончания прошлого окна."""
+    events = sorted(_load_usage().get("events", []), key=lambda e: e.get("t", 0))
+    start, used = None, 0
+    for e in events:
+        t = e.get("t", 0)
+        if start is None or t >= start + WINDOW_5H:
+            start, used = t, 0
+        used += int(e.get("tokens", 0))
+    now = time.time()
+    if start is None or now >= start + WINDOW_5H:
+        return {"active": False, "used": 0, "start": None, "resets_in": 0}
+    return {"active": True, "used": used, "start": start, "resets_in": int(start + WINDOW_5H - now)}
+
+
+def get_usage_summary() -> dict:
+    u = _load_usage()
+    day = datetime.now().strftime("%Y-%m-%d")
+    limit = int(CONFIG.get("credit_limit", 0) or 0)
+    spent = int(u.get("period_spent", 0))
+    percent = round(spent / limit * 100, 1) if limit > 0 else None
+    w5 = get_5h_window()
+    lim5 = int(CONFIG.get("limit_5h", 0) or 0)
+    p5 = round(w5["used"] / lim5 * 100, 1) if lim5 > 0 else None
+    return {
+        "w5_active": w5["active"],
+        "w5_used": w5["used"],
+        "w5_limit": lim5,
+        "w5_percent_used": p5,
+        "w5_percent_left": round(max(0.0, 100 - p5), 1) if p5 is not None else None,
+        "w5_remaining": max(0, lim5 - w5["used"]) if lim5 > 0 else None,
+        "w5_resets_in": w5["resets_in"],
+        "total": u.get("total", 0),
+        "runs": u.get("runs", 0),
+        "today": u.get("by_day", {}).get(day, 0),
+        "by_model": u.get("by_model", {}),
+        "limit": limit,
+        "period_spent": spent,
+        "period_start": u.get("period_start", ""),
+        "percent_used": percent,
+        "percent_left": round(max(0.0, 100 - percent), 1) if percent is not None else None,
+        "remaining": max(0, limit - spent) if limit > 0 else None,
+    }
+
+
+def write_credits_snapshot() -> dict:
+    """Сохраняет текущую сводку расхода в credits_report.json."""
+    snap = get_usage_summary()
+    snap["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        CREDITS_FILE.write_text(json.dumps(snap, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log(f"[credits] не удалось записать отчёт: {e}")
+    return snap
+
+
+def reset_credit_period() -> None:
+    u = _load_usage()
+    u["period_spent"] = 0
+    u["period_start"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    try:
+        USAGE_FILE.write_text(json.dumps(u, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log(f"[usage] не удалось сбросить: {e}")
+    write_credits_snapshot()
+
+
+def get_codex_limits() -> dict:
+    """Лимиты ChatGPT-подписки из последнего лога сессии Codex (если они там есть)."""
+    base = Path(os.path.expanduser("~/.codex/sessions"))
+    if not base.exists():
+        return {}
+    try:
+        files = sorted(base.rglob("rollout-*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+    except Exception:
+        return {}
+    for f in files[:5]:
+        try:
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            if "rate_limits" not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            payload = obj.get("payload", obj)
+            rl = payload.get("rate_limits") if isinstance(payload, dict) else None
+            if rl:
+                return {"limits": rl, "file_time": f.stat().st_mtime}
+    return {}
+
+
+
 def _run_codex(prompt: str, image_paths: list = None) -> dict:
     model = CONFIG.get("model", "gpt-5.6-luna")
     effort = CONFIG.get("effort", "high")
@@ -550,9 +717,11 @@ def _run_codex(prompt: str, image_paths: list = None) -> dict:
         return {"answer": f"❌ код {r.returncode}\n{(r.stderr or '')[-500:]}",
                 "tokens": 0, "ok": False, "files": []}
 
+    tokens_used = _extract_tokens(r.stdout or "")
+    record_usage(model, tokens_used)
     return {
         "answer": _extract_codex_answer(r.stdout or ""),
-        "tokens": _extract_tokens(r.stdout or ""),
+        "tokens": tokens_used,
         "ok": True,
         "files": [],
     }
