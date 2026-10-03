@@ -6,11 +6,12 @@ import shutil
 import subprocess
 import tempfile
 import urllib.request
+import urllib.error
 import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from config import CODEX_PATH, ANDROID_PRESET, CONFIG, DEFAULT_PROJECT_PATH
+from config import CODEX_PATH, CONFIG, DEFAULT_PROJECT_PATH
 
 PROJECT_PATH = Path(
     CONFIG["projects"].get(
@@ -43,7 +44,10 @@ SEND_EXTS = {
     ".zip", ".js", ".ts",
 }
 
-MAX_FILE_SIZE = 45 * 1024 * 1024
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+TEXT_PROMPT_EXTS = {".txt", ".md", ".gd", ".py", ".json", ".cfg", ".ini", ".tscn", ".tres"}
+
+MAX_FILE_SIZE = 20 * 1024 * 1024  # Telegram limit
 
 
 def log(msg: str) -> None:
@@ -56,8 +60,10 @@ def git_commit_push(message: str) -> tuple:
     try:
         subprocess.run(["git", "add", "-A"], cwd=str(PROJECT_PATH),
                        capture_output=True, text=True, timeout=60)
-        subprocess.run(["git", "commit", "-m", message], cwd=str(PROJECT_PATH),
-                       capture_output=True, text=True, timeout=60)
+        r1 = subprocess.run(["git", "commit", "-m", message], cwd=str(PROJECT_PATH),
+                            capture_output=True, text=True, timeout=60)
+        if r1.returncode != 0 and "nothing to commit" in (r1.stdout + r1.stderr):
+            return (True, "nothing to commit")
         r = subprocess.run(["git", "push"], cwd=str(PROJECT_PATH),
                            capture_output=True, text=True, timeout=180)
         return (r.returncode == 0, r.stdout + r.stderr)
@@ -128,10 +134,16 @@ def save_queue(queue: list) -> None:
     QUEUE_FILE.write_text(json.dumps(queue, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def enqueue_task(prompt: str) -> int:
+def enqueue_task(prompt: str, images: list = None) -> int:
     q = load_queue()
-    new_id = (max([t["id"] for t in q], default=0) + 1)
-    q.append({"id": new_id, "prompt": prompt, "status": "pending"})
+    new_id = max([t["id"] for t in q], default=0) + 1
+    q.append({
+        "id": new_id,
+        "prompt": prompt,
+        "images": images or [],
+        "status": "pending",
+        "created": datetime.now().isoformat(),
+    })
     save_queue(q)
     return new_id
 
@@ -195,6 +207,35 @@ def add_to_history(prompt: str) -> None:
     h.append({"prompt": prompt, "date": datetime.now().isoformat()})
     h = h[-50:]
     HISTORY_FILE.write_text(json.dumps(h, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def generate_next_task() -> str:
+    direction = get_direction()
+    if not direction:
+        return ""
+    history = load_history()
+    recent = "\n".join(f"- {h['prompt']}" for h in history[-10:]) or "(пусто)"
+
+    meta = f"""Ты геймдизайнер Godot-игры (2D top-down).
+
+НАПРАВЛЕНИЕ: {direction}
+
+СДЕЛАНО:
+{recent}
+
+Придумай ОДНУ конкретную задачу под направление. Ответь РОВНО одной строкой без кавычек и пояснений."""
+
+    try:
+        r = run_codex_only(meta, None)
+        ans = r.get("answer", "").strip()
+        for line in ans.split("\n"):
+            line = line.strip().strip('"').strip("-").strip()
+            if len(line) > 10 and not line.startswith("["):
+                return line
+        return ""
+    except Exception as e:
+        log(f"generate: {e}")
+        return ""
 
 
 # ============ ПОИСК ФАЙЛОВ ============
@@ -354,7 +395,7 @@ def _extract_tokens(raw: str) -> int:
     return int(d) if d else 0
 
 
-def _run_codex(prompt: str) -> dict:
+def _run_codex(prompt: str, image_paths: list = None) -> dict:
     model = CONFIG.get("model", "gpt-5.6-luna")
     effort = CONFIG.get("effort", "high")
 
@@ -364,8 +405,16 @@ def _run_codex(prompt: str) -> dict:
         "-s", "workspace-write",
         "--model", model,
         "--config", f'model_reasoning_effort="{effort}"',
-        prompt,
     ]
+
+    # Изображения — через --image
+    if image_paths:
+        for img in image_paths:
+            if Path(img).exists():
+                cmd.extend(["--image", str(img)])
+
+    cmd.append(prompt)
+
     log(f"run_codex: {' '.join(cmd[:8])} ...")
 
     try:
@@ -391,45 +440,15 @@ def _run_codex(prompt: str) -> dict:
     }
 
 
-def run_codex(prompt: str, _images=None) -> dict:
-    return _run_codex(prompt)
+def run_codex(prompt: str, image_paths: list = None) -> dict:
+    return _run_codex(prompt, image_paths)
 
 
-def run_codex_only(prompt: str, _images=None) -> dict:
-    return _run_codex(prompt)
+def run_codex_only(prompt: str, image_paths: list = None) -> dict:
+    return _run_codex(prompt, image_paths)
 
 
-# ============ ГЕНЕРАЦИЯ ЗАДАЧ ============
-
-def generate_next_task() -> str:
-    direction = get_direction()
-    if not direction:
-        return ""
-    history = load_history()
-    recent = "\n".join(f"- {h['prompt']}" for h in history[-10:]) or "(пусто)"
-
-    meta = f"""Ты геймдизайнер Godot-игры (2D top-down, королевская битва с зомби, стендами).
-
-НАПРАВЛЕНИЕ: {direction}
-
-СДЕЛАНО: {recent}
-
-Придумай ОДНУ конкретную задачу под направление. Ответь РОВНО одной строкой."""
-
-    try:
-        r = run_codex_only(meta, None)
-        ans = r.get("answer", "").strip()
-        for line in ans.split("\n"):
-            line = line.strip().strip('"').strip("-").strip()
-            if len(line) > 10 and not line.startswith("["):
-                return line
-        return ""
-    except Exception as e:
-        log(f"generate: {e}")
-        return ""
-
-
-# ============ СКАЧИВАНИЕ ВЛОЖЕНИЙ ============
+# ============ ВЛОЖЕНИЯ ============
 
 async def download_attachment_async(file_obj, custom_name: str = None) -> Path:
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -440,7 +459,27 @@ async def download_attachment_async(file_obj, custom_name: str = None) -> Path:
     return lp
 
 
-# ============ ЗАГЛУШКИ (не нужны на Termux) ============
+def classify_attachment(name: str) -> str:
+    """Возвращает: 'image', 'text_prompt', 'zip', 'other'."""
+    ext = Path(name).suffix.lower()
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext == ".zip":
+        return "zip"
+    if ext in TEXT_PROMPT_EXTS:
+        return "text_prompt"
+    return "other"
+
+
+def read_text_prompt(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip()
+    except Exception as e:
+        log(f"read_text_prompt: {e}")
+        return ""
+
+
+# ============ ЗАГЛУШКИ ============
 
 def get_current_version() -> tuple:
     return (0, "auto")
@@ -449,4 +488,4 @@ def increment_version() -> tuple:
     return (0, "auto")
 
 def build_apk() -> Path:
-    raise RuntimeError("На Termux сборка APK идёт через GitHub Actions. Используй /task + /autopilot.")
+    raise RuntimeError("На Termux — только GitHub Actions.")

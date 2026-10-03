@@ -16,16 +16,12 @@ from telegram.request import HTTPXRequest
 
 from config import TELEGRAM_BOT_TOKEN
 from build import (
-    run_codex,
-    run_codex_only,
+    run_codex, run_codex_only,
     download_attachment_async,
-    pack_files_to_zip,
-    find_files_by_pattern,
-    find_files_in_dir,
+    classify_attachment, read_text_prompt,
+    pack_files_to_zip, find_files_by_pattern, find_files_in_dir,
     list_all_files,
-    upload_file_to_project,
-    upload_project_zip,
-    pack_whole_project,
+    upload_file_to_project, upload_project_zip, pack_whole_project,
     load_queue, enqueue_task, pop_task, complete_task, clear_queue,
     set_loop_state, get_loop_state,
     set_direction, get_direction,
@@ -41,7 +37,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-pending_attachments: dict = {}
 user_states: dict = {}
 loop_running: bool = False
 
@@ -61,28 +56,29 @@ def human_size(n: int) -> str:
     return f"{n // (1024 * 1024)} MB"
 
 
-# ============ СТАРТ / СПРАВКА ============
+# ============ СТАРТ ============
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "🎮 <b>Студия Cubism D (Termux)</b>\n\n"
-        "<b>Автопилот (24/7):</b>\n"
-        "• <code>/direction &lt;текст&gt;</code> — задать цель развития\n"
-        "• <code>/autopilot</code> — Luna сама придумывает и делает задачи\n"
-        "• <code>/stop</code> — остановить\n\n"
-        "<b>Задачи вручную:</b>\n"
-        "• <code>/task &lt;промпт&gt;</code> — добавить в очередь\n"
-        "• <code>/queue</code> — показать очередь\n"
-        "• <code>/work</code> — выполнить одну задачу\n"
-        "• <code>/loop</code> — выполнить всю очередь\n"
-        "• <code>/clear</code> — очистить очередь\n\n"
-        "<b>Codex напрямую:</b>\n"
-        "• <code>/luna &lt;промпт&gt;</code> — правки без сборки\n\n"
+        "🎮 <b>Студия Cubism (Termux)</b>\n\n"
+        "<b>Автопилот:</b>\n"
+        "• <code>/direction &lt;текст&gt;</code> — цель развития\n"
+        "• <code>/autopilot</code> — Luna сама придумывает\n"
+        "• <code>/stop</code> — стоп\n\n"
+        "<b>Задачи:</b>\n"
+        "• <code>/task &lt;промпт&gt;</code> — добавить\n"
+        "• Отправь <b>.txt / .md</b> файл → потом <code>/task</code>\n"
+        "• <code>/queue</code> — показать\n"
+        "• <code>/work</code> — выполнить одну\n"
+        "• <code>/loop</code> — всю очередь\n"
+        "• <code>/clear</code> — очистить\n\n"
+        "<b>Codex:</b>\n"
+        "• <code>/luna &lt;промпт&gt;</code>\n"
+        "• Отправь <b>картинку</b> → потом <code>/luna опиши</code>\n\n"
         "<b>Файлы:</b>\n"
-        "• <code>/get &lt;файл&gt;</code> — получить файл\n"
-        "• <code>/download_project</code> — весь проект ZIP\n"
-        "• <code>/upload_project</code> — заменить проект из ZIP\n"
-        "• <code>/upload_to &lt;путь&gt;</code> — загрузить файл\n\n"
+        "• <code>/get &lt;файл&gt;</code> / <code>/download_project</code>\n"
+        "• <code>/upload_project</code> — ZIP проекта\n"
+        "• <code>/upload_to &lt;путь&gt;</code>\n\n"
         "<b>Прочее:</b> <code>/model</code>, <code>/status</code>, <code>/cancel</code>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
@@ -101,21 +97,17 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from config import CONFIG, save_config
-
     args = context.args or []
     if not args:
         await update.message.reply_text(
-            f"🤖 Модель: <code>{CONFIG.get('model', 'gpt-5.6-luna')}</code>\n"
-            f"Уровень: <code>{CONFIG.get('effort', 'high')}</code>\n\n"
-            f"Сменить:\n"
+            f"🤖 <code>{CONFIG.get('model', 'gpt-5.6-luna')}</code>\n"
+            f"⚙️ <code>{CONFIG.get('effort', 'high')}</code>\n\n"
             f"<code>/model gpt-5.6-luna</code>\n"
             f"<code>/model gpt-5.6-sol</code>\n"
-            f"<code>/model gpt-6-astra</code>\n\n"
-            f"Уровень: <code>/model sol high</code>",
+            f"<code>/model sol high</code>",
             parse_mode="HTML",
         )
         return
-
     CONFIG["model"] = args[0]
     if len(args) >= 2:
         CONFIG["effort"] = args[1]
@@ -128,22 +120,18 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from config import CONFIG
-
     queue = load_queue()
     pending = len([t for t in queue if t.get("status") == "pending"])
-    in_progress = len([t for t in queue if t.get("status") == "in_progress"])
+    in_prog = len([t for t in queue if t.get("status") == "in_progress"])
     done = len([t for t in queue if t.get("status") == "done"])
-
     direction = get_direction()
-    dir_text = direction[:150] + "..." if len(direction) > 150 else direction
-    if not dir_text:
-        dir_text = "<i>не задано</i>"
+    dir_text = (direction[:150] + "...") if len(direction) > 150 else (direction or "<i>не задано</i>")
 
     lines = [
         "🔍 <b>Статус</b>\n",
-        f"🤖 Модель: <code>{CONFIG.get('model', '?')}</code> / <code>{CONFIG.get('effort', '?')}</code>",
+        f"🤖 <code>{CONFIG.get('model', '?')}</code> / <code>{CONFIG.get('effort', '?')}</code>",
         f"♻️ Автопилот: <b>{'АКТИВЕН' if get_loop_state() else 'выкл'}</b>",
-        f"📋 Очередь: ⏳ {pending} | 🔄 {in_progress} | ✅ {done}",
+        f"📋 Очередь: ⏳ {pending} | 🔄 {in_prog} | ✅ {done}",
         f"🎯 Направление: {dir_text}",
         f"🐙 GitHub: <code>{GITHUB_REPO or 'не задан'}</code>",
         f"📁 Проект: <code>{escape_html(str(PROJECT_PATH))}</code>",
@@ -155,46 +143,66 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_direction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = " ".join(context.args) if context.args else ""
-
     if not text:
         current = get_direction()
         if current:
             await update.message.reply_text(
-                f"🎯 <b>Направление:</b>\n\n<i>{escape_html(current)}</i>\n\n"
-                f"Сменить: <code>/direction &lt;новый текст&gt;</code>",
+                f"🎯 <b>Направление:</b>\n\n<i>{escape_html(current)}</i>",
                 parse_mode="HTML",
             )
         else:
             await update.message.reply_text(
-                "🎯 Направление не задано.\n\n"
-                "Пример:\n<code>/direction Сделай игру как Brawl Stars — "
-                "короткие матчи, разные персонажи, стенды, анимации</code>",
+                "🎯 Не задано.\n<code>/direction Сделай игру как Brawl Stars</code>",
                 parse_mode="HTML",
             )
         return
-
     await asyncio.to_thread(set_direction, text)
     await update.message.reply_text(
-        f"✅ <b>Направление задано:</b>\n\n<i>{escape_html(text)}</i>\n\n"
-        f"Запусти: <code>/autopilot</code>",
+        f"✅ Задано:\n\n<i>{escape_html(text)}</i>\n\nЗапусти: <code>/autopilot</code>",
         parse_mode="HTML",
     )
 
 
-# ============ ОЧЕРЕДЬ ============
+# ============ ЗАДАЧИ ============
 
 async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    state = user_states.get(user_id, {})
+
+    # 1. Взять текст из аргументов
     prompt = " ".join(context.args) if context.args else ""
+
+    # 2. Или из прикреплённого файла
+    if not prompt and "pending_prompt" in state:
+        prompt = await asyncio.to_thread(read_text_prompt, state["pending_prompt"])
+        user_states[user_id].pop("pending_prompt", None)
+        user_states[user_id].pop("prompt_name", None)
+
+    # 3. Или спросить
     if not prompt:
         await update.message.reply_text(
-            "❌ <code>/task &lt;промпт&gt;</code>", parse_mode="HTML"
+            "❌ Пустой промпт.\n\n"
+            "• <code>/task добавь стенда</code>\n"
+            "• Или отправь .txt файл → потом <code>/task</code>",
+            parse_mode="HTML",
         )
         return
-    task_id = await asyncio.to_thread(enqueue_task, prompt)
+
+    # Картинки
+    images = state.get("pending_images", [])
+    if images:
+        user_states[user_id].pop("pending_images", None)
+
+    task_id = await asyncio.to_thread(enqueue_task, prompt, images)
     queue = load_queue()
     pending = len([t for t in queue if t.get("status") == "pending"])
+
+    attach_info = ""
+    if images:
+        attach_info = f"\n🖼 Картинок: {len(images)}"
+
     await update.message.reply_text(
-        f"✅ Задача #{task_id} добавлена.\n"
+        f"✅ Задача #{task_id} добавлена.{attach_info}\n"
         f"📋 В очереди: <b>{pending}</b>\n\n"
         f"Запустить: <code>/loop</code> или <code>/autopilot</code>",
         parse_mode="HTML",
@@ -206,12 +214,13 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not queue:
         await update.message.reply_text("📋 Очередь пуста.")
         return
-    lines = ["📋 <b>Очередь задач:</b>\n"]
+    lines = ["📋 <b>Очередь:</b>\n"]
     for t in queue[-20:]:
         icon = {"pending": "⏳", "in_progress": "🔄", "done": "✅"}.get(t.get("status"), "❓")
-        lines.append(f"{icon} #{t['id']} — {escape_html(t['prompt'][:80])}")
+        attach = f" 🖼{len(t.get('images', []))}" if t.get("images") else ""
+        lines.append(f"{icon} #{t['id']} — {escape_html(t['prompt'][:70])}{attach}")
     if len(queue) > 20:
-        lines.append(f"\n<i>...и ещё {len(queue) - 20} задач</i>")
+        lines.append(f"\n<i>...и ещё {len(queue) - 20}</i>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -220,28 +229,28 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🗑 Очередь очищена.")
 
 
-# ============ ОБРАБОТКА ОДНОЙ ЗАДАЧИ ============
+# ============ ОБРАБОТКА ============
 
 async def _process_one_task(update: Update, task: dict) -> bool:
     task_id = task["id"]
     prompt = task["prompt"]
+    images = task.get("images", [])
 
     status = await update.message.reply_text(
-        f"🔄 <b>Задача #{task_id}</b>\n<i>{escape_html(prompt[:200])}</i>",
+        f"🔄 <b>Задача #{task_id}</b>\n<i>{escape_html(prompt[:200])}</i>"
+        + (f"\n🖼 Картинок: {len(images)}" if images else ""),
         parse_mode="HTML",
     )
 
-    # 1. Codex правит
+    # 1. Codex
     try:
-        result = await asyncio.to_thread(run_codex, prompt, None)
+        result = await asyncio.to_thread(run_codex, prompt, images or None)
     except Exception as e:
-        await status.edit_text(
-            f"❌ Codex: {escape_html(str(e))}", parse_mode="HTML"
-        )
+        await status.edit_text(f"❌ Codex: {escape_html(str(e))}", parse_mode="HTML")
         return False
 
     if not result or not result.get("ok"):
-        answer = result.get("answer", "?")[:500] if result else "пусто"
+        answer = (result.get("answer", "?") if result else "пусто")[:500]
         await status.edit_text(
             f"❌ Codex упал:\n<pre>{escape_html(answer)}</pre>", parse_mode="HTML"
         )
@@ -260,32 +269,28 @@ async def _process_one_task(update: Update, task: dict) -> bool:
         )
     else:
         await status.edit_text(
-            f"✅ <b>Задача #{task_id}</b>\n"
-            f"Код запушен в GitHub.\n\n"
+            f"✅ <b>Задача #{task_id}</b>\nКод запушен.\n\n"
             f"<pre>{escape_html(short)}</pre>",
             parse_mode="HTML",
         )
 
-    # 3. Ждём APK из GitHub Actions
+    # 3. Ждём APK
     if not (GITHUB_REPO and GITHUB_TOKEN):
         await update.message.reply_text(
-            "⚠️ GITHUB_REPO или GITHUB_TOKEN не заданы в .env — APK не получен."
+            "⚠️ GITHUB_REPO / GITHUB_TOKEN не заданы — APK не получен."
         )
         await asyncio.to_thread(complete_task, task_id)
         return True
 
     prev_tag = await asyncio.to_thread(get_latest_release_tag, GITHUB_REPO, GITHUB_TOKEN)
-    await update.message.reply_text(
-        f"⏳ Жду сборку APK из GitHub Actions (до 15 мин)...", parse_mode="HTML"
-    )
+    await update.message.reply_text("⏳ Жду APK из GitHub Actions (до 15 мин)...")
 
     new_tag = await asyncio.to_thread(
         wait_for_new_release, GITHUB_REPO, GITHUB_TOKEN, prev_tag, 900
     )
-
     if not new_tag:
         await update.message.reply_text(
-            "⚠️ APK не пришёл за 15 минут. Проверь вкладку Actions в GitHub."
+            "⚠️ APK не пришёл за 15 мин. Проверь Actions в GitHub."
         )
         await asyncio.to_thread(complete_task, task_id)
         return False
@@ -295,9 +300,7 @@ async def _process_one_task(update: Update, task: dict) -> bool:
         download_latest_apk, GITHUB_REPO, GITHUB_TOKEN, apk_path
     )
     if not got:
-        await update.message.reply_text(
-            f"⚠️ Релиз {new_tag} есть, но APK не скачался."
-        )
+        await update.message.reply_text(f"⚠️ Релиз {new_tag} есть, но APK не скачался.")
         await asyncio.to_thread(complete_task, task_id)
         return False
 
@@ -306,20 +309,13 @@ async def _process_one_task(update: Update, task: dict) -> bool:
         await update.message.reply_document(
             document=f,
             filename=f"cubism_{new_tag}.apk",
-            caption=(
-                f"✅ <b>Задача #{task_id} собрана</b>\n"
-                f"📦 {new_tag}\n"
-                f"💾 {size_mb:.1f} MB\n\n"
-                f"Установи и проверь."
-            ),
+            caption=f"✅ <b>Задача #{task_id}</b>\n📦 {new_tag}\n💾 {size_mb:.1f} MB",
             parse_mode="HTML",
         )
 
     await asyncio.to_thread(complete_task, task_id)
     return True
 
-
-# ============ РУЧНОЕ ВЫПОЛНЕНИЕ ============
 
 async def cmd_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     task = await asyncio.to_thread(pop_task)
@@ -330,12 +326,10 @@ async def cmd_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _loop_queue(update: Update) -> None:
-    """Выполняет очередь один раз до конца."""
     global loop_running
     loop_running = True
     set_loop_state(True)
-
-    await update.message.reply_text("♻️ Начинаю выполнять очередь...")
+    await update.message.reply_text("♻️ Выполняю очередь...")
 
     while loop_running:
         task = await asyncio.to_thread(pop_task)
@@ -363,56 +357,44 @@ async def cmd_loop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio.create_task(_loop_queue(update))
 
 
-# ============ АВТОПИЛОТ 24/7 ============
+# ============ АВТОПИЛОТ ============
 
 async def _autopilot_loop(update: Update) -> None:
     global loop_running
-
     direction = get_direction()
     if not direction:
         await update.message.reply_text(
-            "❌ Сначала задай направление: <code>/direction &lt;текст&gt;</code>",
-            parse_mode="HTML",
+            "❌ Сначала: <code>/direction &lt;текст&gt;</code>", parse_mode="HTML"
         )
         return
 
     loop_running = True
     set_loop_state(True)
-
     await update.message.reply_text(
-        f"🚀 <b>Автопилот 24/7 запущен</b>\n\n"
-        f"🎯 <i>{escape_html(direction[:200])}</i>\n\n"
-        f"Luna сама придумывает и делает задачи. Остановить: /stop",
+        f"🚀 <b>Автопилот запущен</b>\n\n🎯 <i>{escape_html(direction[:200])}</i>",
         parse_mode="HTML",
     )
 
     iteration = 0
     while loop_running:
         iteration += 1
-
-        # Сначала — ручные задачи
         task = await asyncio.to_thread(pop_task)
 
-        # Если очередь пуста — Luna придумывает
         if not task:
             await update.message.reply_text(
-                f"🧠 <b>Итерация {iteration}</b> — Luna думает...",
-                parse_mode="HTML",
+                f"🧠 Итерация {iteration} — Luna думает...", parse_mode="HTML"
             )
             new_prompt = await asyncio.to_thread(generate_next_task)
             if not new_prompt:
-                await update.message.reply_text(
-                    "⚠️ Luna не придумала задачу. Жду 5 минут."
-                )
+                await update.message.reply_text("⚠️ Luna не придумала. Жду 5 мин.")
                 await asyncio.sleep(300)
                 continue
-
             await update.message.reply_text(
                 f"💡 <b>Luna придумала:</b>\n<i>{escape_html(new_prompt)}</i>",
                 parse_mode="HTML",
             )
             await asyncio.to_thread(add_to_history, new_prompt)
-            task = {"id": -iteration, "prompt": new_prompt, "status": "auto"}
+            task = {"id": -iteration, "prompt": new_prompt, "images": [], "status": "auto"}
 
         try:
             await _process_one_task(update, task)
@@ -432,7 +414,7 @@ async def _autopilot_loop(update: Update) -> None:
 async def cmd_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global loop_running
     if loop_running:
-        await update.message.reply_text("🚀 Автопилот уже работает.")
+        await update.message.reply_text("🚀 Уже работает.")
         return
     asyncio.create_task(_autopilot_loop(update))
 
@@ -441,23 +423,45 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global loop_running
     loop_running = False
     set_loop_state(False)
-    await update.message.reply_text("⏹ Остановлено. Текущая задача доработается.")
+    await update.message.reply_text("⏹ Остановлено.")
 
 
-# ============ РУЧНЫЕ КОМАНДЫ CODEX ============
+# ============ CODEX ============
 
 async def cmd_luna(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    state = user_states.get(user_id, {})
+
     prompt = " ".join(context.args) if context.args else ""
-    if not prompt:
+
+    # Из файла
+    if not prompt and "pending_prompt" in state:
+        prompt = await asyncio.to_thread(read_text_prompt, state["pending_prompt"])
+        user_states[user_id].pop("pending_prompt", None)
+        user_states[user_id].pop("prompt_name", None)
+
+    images = state.get("pending_images", [])
+    if images:
+        user_states[user_id].pop("pending_images", None)
+
+    if not prompt and not images:
         await update.message.reply_text(
-            "❌ <code>/luna &lt;промпт&gt;</code>", parse_mode="HTML"
+            "❌ <code>/luna &lt;промпт&gt;</code>\n"
+            "Или отправь .txt файл / картинку.",
+            parse_mode="HTML",
         )
         return
 
-    status = await update.message.reply_text("🌙 Luna работает...")
+    if not prompt:
+        prompt = "Опиши это изображение и предложи улучшения."
+
+    attach_info = f"\n🖼 Картинок: {len(images)}" if images else ""
+    status = await update.message.reply_text(
+        f"🌙 Luna работает...{attach_info}", parse_mode="HTML"
+    )
 
     try:
-        result = await asyncio.to_thread(run_codex_only, prompt, None)
+        result = await asyncio.to_thread(run_codex_only, prompt, images or None)
         answer = result.get("answer", "") if result else ""
         if not answer.strip():
             answer = "(пустой ответ)"
@@ -466,9 +470,7 @@ async def cmd_luna(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             fp = Path(tempfile.gettempdir()) / "luna_out.txt"
             fp.write_text(answer, encoding="utf-8")
             with open(fp, "rb") as f:
-                await update.message.reply_document(
-                    document=f, filename="luna_out.txt"
-                )
+                await update.message.reply_document(document=f, filename="luna_out.txt")
             await status.delete()
         else:
             await status.edit_text(
@@ -476,18 +478,14 @@ async def cmd_luna(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="HTML",
             )
     except Exception as e:
-        await status.edit_text(
-            f"❌ {escape_html(str(e))}", parse_mode="HTML"
-        )
+        await status.edit_text(f"❌ {escape_html(str(e))}", parse_mode="HTML")
 
 
 async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "⚠️ На Termux локальная сборка APK недоступна.\n\n"
-        "Используй:\n"
-        "• <code>/task &lt;промпт&gt;</code> — добавить задачу\n"
-        "• <code>/autopilot</code> — Luna сама делает и пушит в GitHub\n\n"
-        "APK прилетит из GitHub Actions автоматически.",
+        "⚠️ На Termux локальная сборка недоступна.\n\n"
+        "Используй <code>/task</code> + <code>/loop</code> — "
+        "APK придёт из GitHub Actions.",
         parse_mode="HTML",
     )
 
@@ -498,11 +496,9 @@ async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     if not args:
         await update.message.reply_text(
-            "📂 <b>Запрос файлов</b>\n\n"
-            "• <code>/get player.gd</code>\n"
-            "• <code>/get *.gd</code>\n"
-            "• <code>/get sprites/</code>\n"
-            "• <code>/get list</code>",
+            "📂 <code>/get player.gd</code>\n"
+            "📂 <code>/get *.gd</code>\n"
+            "📂 <code>/get list</code>",
             parse_mode="HTML",
         )
         return
@@ -523,8 +519,7 @@ async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
         else:
             await update.message.reply_text(
-                f"📂 <b>Файлы ({len(files)}):</b>\n\n<pre>{escape_html(text)}</pre>",
-                parse_mode="HTML",
+                f"<pre>{escape_html(text)}</pre>", parse_mode="HTML"
             )
         return
 
@@ -539,9 +534,7 @@ async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(files) == 1:
         f = files[0]
         with open(f, "rb") as fp:
-            await update.message.reply_document(
-                document=fp, filename=f.name
-            )
+            await update.message.reply_document(document=fp, filename=f.name)
         await status.delete()
         return
 
@@ -560,12 +553,12 @@ async def cmd_download_project(update: Update, context: ContextTypes.DEFAULT_TYP
         zp = await asyncio.to_thread(pack_whole_project)
         size_mb = zp.stat().st_size / (1024 * 1024)
         if size_mb > 45:
-            await status.edit_text(f"⚠️ {size_mb:.1f} MB — больше лимита Telegram.")
+            await status.edit_text(f"⚠️ {size_mb:.1f} MB — больше лимита.")
             return
         with open(zp, "rb") as f:
             await update.message.reply_document(
                 document=f, filename=zp.name,
-                caption=f"📦 Весь проект ({size_mb:.1f} MB)",
+                caption=f"📦 Проект ({size_mb:.1f} MB)",
             )
         await status.delete()
     except Exception as e:
@@ -573,34 +566,72 @@ async def cmd_download_project(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка входящих документов и фото."""
     msg = update.message
     user_id = update.effective_user.id
 
-    if not msg.document:
+    # Фото (сжатые)
+    if msg.photo:
+        file_obj = await msg.photo[-1].get_file()
+        name = f"photo_{msg.photo[-1].file_unique_id}.jpg"
+        local = await download_attachment_async(file_obj, name)
+        user_states.setdefault(user_id, {}).setdefault("pending_images", []).append(str(local))
+        await msg.reply_text(
+            f"🖼 Картинка сохранена ({human_size(local.stat().st_size)}).\n\n"
+            f"<code>/luna опиши</code> или <code>/task доработай по референсу</code>",
+            parse_mode="HTML",
+        )
         return
 
-    file_obj = await msg.document.get_file()
-    name = msg.document.file_name or "file"
-    local = await download_attachment_async(file_obj, name)
+    # Документ
+    if msg.document:
+        file_obj = await msg.document.get_file()
+        name = msg.document.file_name or f"doc_{msg.document.file_unique_id}"
+        local = await download_attachment_async(file_obj, name)
+        kind = classify_attachment(name)
+        size = human_size(local.stat().st_size)
 
-    user_states[user_id] = {"pending_upload": str(local)}
+        if kind == "image":
+            user_states.setdefault(user_id, {}).setdefault("pending_images", []).append(str(local))
+            await msg.reply_text(
+                f"🖼 Картинка: <code>{escape_html(name)}</code> ({size})\n\n"
+                f"<code>/luna опиши</code>",
+                parse_mode="HTML",
+            )
 
-    await msg.reply_text(
-        f"📦 <code>{escape_html(name)}</code> ({human_size(local.stat().st_size)})\n\n"
-        f"Куда положить?\n"
-        f"• <code>/upload_project</code> — заменить весь проект\n"
-        f"• <code>/upload_to &lt;путь&gt;</code> — распаковать в папку",
-        parse_mode="HTML",
-    )
+        elif kind == "text_prompt":
+            user_states.setdefault(user_id, {})["pending_prompt"] = str(local)
+            user_states[user_id]["prompt_name"] = name
+            await msg.reply_text(
+                f"📝 Текстовый промпт: <code>{escape_html(name)}</code> ({size})\n\n"
+                f"Отправь <code>/task</code> или <code>/luna</code> без текста — "
+                f"файл станет промптом.",
+                parse_mode="HTML",
+            )
+
+        elif kind == "zip":
+            user_states.setdefault(user_id, {})["pending_upload"] = str(local)
+            await msg.reply_text(
+                f"📦 ZIP: <code>{escape_html(name)}</code> ({size})\n\n"
+                f"<code>/upload_project</code> — заменить проект\n"
+                f"<code>/upload_to &lt;путь&gt;</code> — распаковать в папку",
+                parse_mode="HTML",
+            )
+
+        else:
+            user_states.setdefault(user_id, {})["pending_upload"] = str(local)
+            await msg.reply_text(
+                f"📦 Файл: <code>{escape_html(name)}</code> ({size})\n\n"
+                f"<code>/upload_to &lt;путь&gt;</code>",
+                parse_mode="HTML",
+            )
 
 
 async def cmd_upload_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     state = user_states.get(user_id, {})
     if "pending_upload" not in state:
-        await update.message.reply_text(
-            "❌ Сначала отправь ZIP-архив боту."
-        )
+        await update.message.reply_text("❌ Сначала отправь ZIP-архив.")
         return
 
     status = await update.message.reply_text("📦 Распаковываю в проект...")
@@ -608,14 +639,12 @@ async def cmd_upload_project(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if result["ok"]:
         await status.edit_text(
-            f"✅ <b>Проект заменён</b>\n📦 Распаковано: <b>{result['unpacked']}</b>",
+            f"✅ Проект заменён\n📦 Распаковано: <b>{result['unpacked']}</b>",
             parse_mode="HTML",
         )
-        user_states[user_id] = {}
+        user_states[user_id].pop("pending_upload", None)
     else:
-        await status.edit_text(
-            f"❌ {escape_html(result['message'])}", parse_mode="HTML"
-        )
+        await status.edit_text(f"❌ {escape_html(result['message'])}", parse_mode="HTML")
 
 
 async def cmd_upload_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -627,9 +656,7 @@ async def cmd_upload_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     args = context.args or []
     if not args:
-        await update.message.reply_text(
-            "❌ <code>/upload_to &lt;путь&gt;</code>", parse_mode="HTML"
-        )
+        await update.message.reply_text("❌ <code>/upload_to &lt;путь&gt;</code>", parse_mode="HTML")
         return
 
     target = " ".join(args)
@@ -641,30 +668,26 @@ async def cmd_upload_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if result["ok"]:
         if result.get("is_archive"):
             await status.edit_text(
-                f"✅ Распаковано <b>{result['unpacked']}</b> файлов в "
+                f"✅ Распаковано <b>{result['unpacked']}</b> в "
                 f"<code>{escape_html(result['target'])}</code>",
                 parse_mode="HTML",
             )
         else:
             await status.edit_text(
-                f"✅ Загружено: <code>{escape_html(result['target'])}</code>",
+                f"✅ <code>{escape_html(result['target'])}</code>",
                 parse_mode="HTML",
             )
-        user_states[user_id] = {}
+        user_states[user_id].pop("pending_upload", None)
     else:
-        await status.edit_text(
-            f"❌ {escape_html(result['message'])}", parse_mode="HTML"
-        )
+        await status.edit_text(f"❌ {escape_html(result['message'])}", parse_mode="HTML")
 
 
 # ============ ЗАПУСК ============
 
 def main() -> None:
     request = HTTPXRequest(
-        connect_timeout=30.0,
-        read_timeout=30.0,
-        write_timeout=30.0,
-        pool_timeout=30.0,
+        connect_timeout=30.0, read_timeout=30.0,
+        write_timeout=30.0, pool_timeout=30.0,
     )
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(request).build()
 
@@ -697,8 +720,11 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
-    # Вложения
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_attachment))
+    # Вложения — фото и документы
+    app.add_handler(MessageHandler(
+        filters.PHOTO | filters.Document.ALL,
+        handle_attachment,
+    ))
 
     logger.info("Бот запущен (Termux).")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
