@@ -25,10 +25,6 @@ from build import (
     load_queue, enqueue_task, pop_task, complete_task, clear_queue,
     set_loop_state, get_loop_state,
     set_direction, get_direction,
-    generate_ideas, generate_tasks_for_idea,
-    save_ideas, load_ideas, pop_idea,
-    save_subtasks, load_subtasks, pop_subtask,
-    get_next_task_smart,
     add_to_history,
     git_commit_push, ensure_git_config,
     download_latest_apk, get_latest_release_tag, wait_for_new_release,
@@ -111,24 +107,20 @@ def _attach_line(a: dict) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "🎮 <b>Студия Cubism (Termux)</b>\n\n"
-        "<b>Планирование:</b>\n"
+        "<b>Главное:</b>\n"
         "• <code>/direction &lt;цель&gt;</code> — задать цель\n"
-        "• <code>/plan_ideas</code> — Luna разобьёт на идеи\n"
-        "• <code>/show_ideas</code> — показать идеи и подзадачи\n\n"
-        "<b>Автопилот:</b>\n"
-        "• <code>/autopilot</code> — Luna сама делает всё\n"
+        "• <code>/autopilot</code> — Codex делает ВСЁ за один раз\n"
+        "• <code>/build_apk</code> — собрать APK\n"
         "• <code>/stop</code> — остановить\n\n"
-        "<b>Сборка:</b>\n"
-        "• <code>/build_apk</code> — собрать APK через GitHub\n\n"
-        "<b>Задачи вручную:</b>\n"
-        "• <code>/task &lt;промпт&gt;</code> / <code>/build &lt;промпт&gt;</code>\n"
-        "• <code>/queue</code> / <code>/work</code> / <code>/loop</code> / <code>/clear</code>\n\n"
+        "<b>Ручные задачи:</b>\n"
+        "• <code>/task &lt;промпт&gt;</code>\n"
+        "• <code>/loop</code> / <code>/queue</code> / <code>/clear</code>\n\n"
         "<b>Codex:</b> <code>/luna &lt;промпт&gt;</code>\n\n"
         "<b>Файлы:</b>\n"
         "• <code>/get &lt;файл&gt;</code> / <code>/download_project</code>\n"
         "• <code>/upload_project</code> / <code>/upload_to &lt;путь&gt;</code>\n\n"
         "<b>📎 Вложения — во ВСЕХ командах:</b>\n"
-        "• .txt .md .gd .json .py → промпт\n"
+        "• .txt .md .gd → промпт\n"
         "• фото / видео → Codex\n"
         "• .zip → замена проекта\n\n"
         "<b>Прочее:</b> <code>/model</code>, <code>/status</code>, <code>/cancel</code>"
@@ -185,9 +177,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     direction = get_direction()
     dir_text = (direction[:150] + "...") if len(direction) > 150 else (direction or "<i>не задано</i>")
 
-    ideas = load_ideas()
-    subtasks = load_subtasks()
-
     p = _peek(update.effective_user.id)
     att = []
     if p["has_prompt"]:
@@ -206,7 +195,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"🤖 <code>{CONFIG.get('model', '?')}</code> / <code>{CONFIG.get('effort', '?')}</code>",
         f"♻️ Автопилот: <b>{'АКТИВЕН' if get_loop_state() else 'выкл'}</b>",
         f"📋 Очередь: ⏳ {pending} | 🔄 {in_prog} | ✅ {done}",
-        f"💡 Идей: {len(ideas)} | 📌 Подзадач: {len(subtasks)}",
         f"🎯 Направление: {dir_text}",
         f"🐙 GitHub: <code>{GITHUB_REPO or 'не задан'}</code>",
         f"📁 Проект: <code>{escape_html(str(PROJECT_PATH))}</code>",
@@ -242,68 +230,9 @@ async def cmd_direction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await asyncio.to_thread(set_direction, text)
     await update.message.reply_text(
-        f"✅ Задано:\n\n<i>{escape_html(text[:500])}</i>\n\n"
-        f"Дальше: <code>/plan_ideas</code> или <code>/autopilot</code>",
+        f"✅ Задано:\n\n<i>{escape_html(text[:500])}</i>\n\nЗапусти: <code>/autopilot</code>",
         parse_mode="HTML",
     )
-
-
-# ============ ПЛАНИРОВАНИЕ ============
-
-async def cmd_plan_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    direction = get_direction()
-    if not direction:
-        await update.message.reply_text(
-            "❌ Сначала: <code>/direction &lt;текст&gt;</code>", parse_mode="HTML"
-        )
-        return
-
-    status = await update.message.reply_text(
-        "🧠 Luna разбивает направление на идеи (1–2 мин)..."
-    )
-
-    ideas = await asyncio.to_thread(generate_ideas, direction, 10)
-
-    if not ideas:
-        await status.edit_text("❌ Luna не смогла. Попробуй другое направление.")
-        return
-
-    await asyncio.to_thread(save_ideas, ideas)
-
-    lines = [f"💡 <b>Идеи ({len(ideas)}):</b>\n"]
-    for i, idea in enumerate(ideas, 1):
-        lines.append(f"{i}. {escape_html(idea)}")
-
-    await status.edit_text("\n".join(lines), parse_mode="HTML")
-    await update.message.reply_text(
-        "▶️ Запустить: <code>/autopilot</code>\n"
-        "📋 Показать: <code>/show_ideas</code>",
-        parse_mode="HTML",
-    )
-
-
-async def cmd_show_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ideas = await asyncio.to_thread(load_ideas)
-    subtasks = await asyncio.to_thread(load_subtasks)
-
-    if not ideas and not subtasks:
-        await update.message.reply_text("📋 Планов нет.")
-        return
-
-    lines = []
-    if ideas:
-        lines.append(f"💡 <b>Идеи ({len(ideas)}):</b>\n")
-        for i, idea in enumerate(ideas, 1):
-            lines.append(f"{i}. {escape_html(idea)}")
-
-    if subtasks:
-        lines.append(f"\n📌 <b>Подзадачи ({len(subtasks)}):</b>\n")
-        for i, t in enumerate(subtasks[:10], 1):
-            lines.append(f"{i}. {escape_html(t)}")
-        if len(subtasks) > 10:
-            lines.append(f"<i>...и ещё {len(subtasks) - 10}</i>")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ============ ЗАДАЧИ ============
@@ -385,7 +314,7 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🗑 Очередь очищена.")
 
 
-# ============ ВЫПОЛНЕНИЕ ============
+# ============ ВЫПОЛНЕНИЕ РУЧНОЙ ОЧЕРЕДИ ============
 
 async def _process_one_task(update: Update, task: dict) -> bool:
     task_id = task["id"]
@@ -428,9 +357,9 @@ async def _process_one_task(update: Update, task: dict) -> bool:
 
     await status.edit_text(
         f"✅ <b>Задача #{task_id}</b>\n"
-        f"Код запушен в GitHub.\n\n"
+        f"Код запушен.\n\n"
         f"<pre>{escape_html(short)}</pre>\n\n"
-        f"<i>APK соберётся по /build_apk</i>",
+        f"<i>APK: /build_apk</i>",
         parse_mode="HTML",
     )
 
@@ -488,7 +417,7 @@ async def cmd_loop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio.create_task(_loop_queue(update))
 
 
-# ============ АВТОПИЛОТ ============
+# ============ АВТОПИЛОТ (ОДИН ПРОМПТ) ============
 
 async def _autopilot_loop(update: Update) -> None:
     global loop_running
@@ -501,86 +430,110 @@ async def _autopilot_loop(update: Update) -> None:
 
     loop_running = True
     set_loop_state(True)
+
     await update.message.reply_text(
         f"🚀 <b>Автопилот запущен</b>\n\n"
-        f"🎯 <i>{escape_html(direction[:200])}</i>\n\n"
-        f"Luna будет:\n"
-        f"1. Генерировать идеи\n"
-        f"2. Разбивать их на задачи\n"
-        f"3. Делать задачи\n\n"
-        f"APK — по /build_apk\n"
+        f"🎯 <i>{escape_html(direction[:300])}</i>\n\n"
+        f"Codex работает над всей задачей за один раз.\n"
+        f"Это может занять 1–2 часа.\n\n"
+        f"Когда закончит — пришлю результат.\n"
+        f"Собрать APK: /build_apk\n"
         f"Остановить: /stop",
         parse_mode="HTML",
     )
 
-    iteration = 0
-    ok_count = 0
-    fail_count = 0
-    consecutive_fails = 0
+    big_prompt = f"""Работай над Godot-проектом в текущей папке.
 
-    while loop_running:
-        iteration += 1
+ОБЩАЯ ЗАДАЧА:
+{direction}
 
-        task = await asyncio.to_thread(pop_task)
+ТРЕБОВАНИЯ:
+1. Изучи текущие файлы проекта (project.godot, scenes/, scripts/, autoloads/).
+2. Делай всё по порядку: сначала фундамент (сцены, скрипты), потом фичи.
+3. Изменяй столько файлов, сколько нужно. Не спрашивай — делай.
+4. Если чего-то не хватает (сцены, скрипты, спрайты) — создавай заглушки.
+5. Работай до тех пор, пока не сделаешь всё, что можешь.
 
-        if not task:
-            new_prompt = await asyncio.to_thread(get_next_task_smart)
+НЕ ОСТАНАВЛИВАЙСЯ НА ОДНОМ ФАЙЛЕ — делaй всё, что нужно для выполнения задачи."""
 
-            if not new_prompt:
-                consecutive_fails += 1
-                await update.message.reply_text(
-                    f"⚠️ Luna не спланировала ({consecutive_fails}/3). Жду 2 мин."
-                )
-                if consecutive_fails >= 3:
-                    await update.message.reply_text(
-                        "🛑 Luna не может планировать. Автопилот остановлен.",
-                        parse_mode="HTML",
-                    )
-                    break
-                await asyncio.sleep(120)
-                continue
+    status = await update.message.reply_text(
+        "🧠 <b>Codex работает...</b>\n"
+        "Может занять 1–2 часа. Обновляю статус каждую минуту.\n\n"
+        "<i>0 минут...</i>",
+        parse_mode="HTML",
+    )
 
-            consecutive_fails = 0
-            await update.message.reply_text(
-                f"💡 <b>Задача {iteration}:</b>\n<i>{escape_html(new_prompt)}</i>",
-                parse_mode="HTML",
-            )
-            await asyncio.to_thread(add_to_history, new_prompt)
-            task = {"id": -iteration, "prompt": new_prompt, "images": [], "status": "auto"}
+    task = asyncio.create_task(asyncio.to_thread(run_codex, big_prompt, None))
 
+    elapsed = 0
+    while not task.done() and loop_running:
+        await asyncio.sleep(60)
+        elapsed += 1
         try:
-            success = await _process_one_task(update, task)
-            if success:
-                ok_count += 1
-                consecutive_fails = 0
-            else:
-                fail_count += 1
-                consecutive_fails += 1
-        except Exception as e:
-            fail_count += 1
-            consecutive_fails += 1
-            await update.message.reply_text(
-                f"❌ Ошибка: {escape_html(str(e))}", parse_mode="HTML"
-            )
-
-        if consecutive_fails >= 3:
-            await update.message.reply_text(
-                "🛑 3 ошибки подряд. Возможно, кредиты Luna кончились.\n"
-                "Автопилот остановлен.",
+            await status.edit_text(
+                f"🧠 <b>Codex работает...</b>\n"
+                f"Прошло: <b>{elapsed} мин</b>\n\n"
+                f"<i>Обновление каждую минуту.</i>",
                 parse_mode="HTML",
             )
-            break
+        except Exception:
+            pass
 
-        await asyncio.sleep(5)
+    if not loop_running:
+        await update.message.reply_text("⏹ Остановлено пользователем.")
+        loop_running = False
+        set_loop_state(False)
+        return
+
+    try:
+        result = task.result()
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Ошибка Codex: {escape_html(str(e))}", parse_mode="HTML"
+        )
+        loop_running = False
+        set_loop_state(False)
+        return
+
+    if not result or not result.get("ok"):
+        answer = (result.get("answer", "?") if result else "пусто")[:500]
+        await update.message.reply_text(
+            f"❌ Codex упал:\n<pre>{escape_html(answer)}</pre>", parse_mode="HTML"
+        )
+        loop_running = False
+        set_loop_state(False)
+        return
+
+    answer = result.get("answer", "")
+    short = answer[:800] if len(answer) > 800 else answer
+
+    await update.message.reply_text(
+        "📦 Codex закончил. Коммичу изменения в GitHub..."
+    )
+
+    commit_msg = f"[auto] {direction[:60]}"
+    ok, git_out = await asyncio.to_thread(git_commit_push, commit_msg)
+
+    if not ok:
+        await update.message.reply_text(
+            f"❌ <b>Git НЕ прошёл</b>\n<pre>{escape_html(git_out[-400:])}</pre>",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ <b>Готово!</b>\n\n"
+            f"<pre>{escape_html(short)}</pre>\n\n"
+            f"Собрать APK: <code>/build_apk</code>",
+            parse_mode="HTML",
+        )
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
 
     loop_running = False
     set_loop_state(False)
-    await update.message.reply_text(
-        f"⏹ <b>Автопилот остановлен</b>\n"
-        f"📊 Успешно: {ok_count} | Ошибок: {fail_count}\n\n"
-        f"Собрать APK: <code>/build_apk</code>",
-        parse_mode="HTML",
-    )
 
 
 async def cmd_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -920,7 +873,6 @@ async def cmd_upload_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ============ ЗАПУСК ============
 
 def main() -> None:
-    # Фикс Python 3.14
     import asyncio as _asyncio
     try:
         _asyncio.get_event_loop()
@@ -946,8 +898,6 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     app.add_handler(CommandHandler("direction", cmd_direction))
-    app.add_handler(CommandHandler("plan_ideas", cmd_plan_ideas))
-    app.add_handler(CommandHandler("show_ideas", cmd_show_ideas))
     app.add_handler(CommandHandler("autopilot", cmd_autopilot))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("build_apk", cmd_build_apk))
