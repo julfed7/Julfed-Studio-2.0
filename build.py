@@ -30,6 +30,8 @@ QUEUE_FILE = Path(__file__).parent / "task_queue.json"
 LOOP_STATE_FILE = Path(__file__).parent / "loop_state.json"
 DIRECTION_FILE = Path(__file__).parent / "direction.txt"
 HISTORY_FILE = Path(__file__).parent / "task_history.json"
+IDEAS_FILE = Path(__file__).parent / "ideas.json"
+SUBTASKS_FILE = Path(__file__).parent / "subtasks.json"
 
 IGNORE_DIRS = {
     ".git", ".godot", "node_modules", "__pycache__",
@@ -58,10 +60,42 @@ def log(msg: str) -> None:
 
 # ============ GIT ============
 
-def git_commit_push(message: str) -> tuple:
-    """Git add + commit + push с retry и авто-pull."""
+def ensure_git_config() -> bool:
     try:
-        # git add
+        name = subprocess.run(
+            ["git", "config", "--global", "user.name"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        email = subprocess.run(
+            ["git", "config", "--global", "user.email"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+
+        if not name:
+            subprocess.run(
+                ["git", "config", "--global", "user.name", "julfed7"],
+                capture_output=True, text=True, timeout=10,
+            )
+            log("[git] установлен user.name")
+
+        if not email:
+            subprocess.run(
+                ["git", "config", "--global", "user.email",
+                 "xxxlolxxx338@gmail.com"],
+                capture_output=True, text=True, timeout=10,
+            )
+            log("[git] установлен user.email")
+
+        return True
+    except Exception as e:
+        log(f"[git] ошибка: {e}")
+        return False
+
+
+def git_commit_push(message: str) -> tuple:
+    try:
+        ensure_git_config()
+
         r0 = subprocess.run(
             ["git", "add", "-A"],
             cwd=str(PROJECT_PATH),
@@ -69,9 +103,17 @@ def git_commit_push(message: str) -> tuple:
         )
         log(f"[git add] rc={r0.returncode}")
         if r0.returncode != 0:
-            log(f"[git add] stderr: {(r0.stderr or '')[-300:]}")
+            return (False, f"git add failed: {(r0.stderr or '')[-300:]}")
 
-        # git commit
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(PROJECT_PATH),
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        if not status:
+            log("[git] изменений нет")
+            return (False, "nothing to commit — Codex ничего не изменил")
+
         r1 = subprocess.run(
             ["git", "commit", "-m", message],
             cwd=str(PROJECT_PATH),
@@ -81,10 +123,9 @@ def git_commit_push(message: str) -> tuple:
         log(f"[git commit] rc={r1.returncode}")
         log(f"[git commit] {combined1[-300:]}")
 
-        if r1.returncode != 0 and "nothing to commit" in combined1.lower():
-            return (True, "nothing to commit")
+        if r1.returncode != 0:
+            return (False, f"git commit failed: {combined1[-300:]}")
 
-        # git push — 3 попытки
         for attempt in range(3):
             log(f"[git push] попытка {attempt + 1}/3...")
             try:
@@ -100,16 +141,15 @@ def git_commit_push(message: str) -> tuple:
                 if r.returncode == 0:
                     return (True, combined)
 
-                # Конфликт — pull и повторить
                 if "rejected" in combined.lower() or "non-fast-forward" in combined.lower():
-                    log("[git push] конфликт, делаю pull --rebase...")
+                    log("[git push] конфликт, pull --rebase...")
                     subprocess.run(
                         ["git", "pull", "--rebase", "--no-edit"],
                         cwd=str(PROJECT_PATH),
                         capture_output=True, text=True, timeout=300,
                     )
             except subprocess.TimeoutExpired:
-                log(f"[git push] таймаут попытки {attempt + 1}")
+                log(f"[git push] таймаут {attempt + 1}")
             except Exception as e:
                 log(f"[git push] ошибка: {e}")
 
@@ -117,7 +157,6 @@ def git_commit_push(message: str) -> tuple:
                 time.sleep(10)
 
         return (False, "git push failed after 3 attempts")
-
     except Exception as e:
         return (False, str(e))
 
@@ -167,6 +206,27 @@ def wait_for_new_release(repo: str, token: str, prev_tag: str, timeout_sec: int 
             return tag
         time.sleep(20)
     return ""
+
+
+def trigger_build_workflow(repo: str, token: str, workflow_file: str = "release.yml") -> bool:
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/dispatches"
+    data = json.dumps({
+        "ref": "main",
+        "inputs": {"reason": "Build from Telegram bot"},
+    }).encode("utf-8")
+
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Authorization", f"token {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            log(f"[GH] dispatch: {resp.status}")
+            return resp.status == 204
+    except Exception as e:
+        log(f"[GH] dispatch ошибка: {e}")
+        return False
 
 
 # ============ ОЧЕРЕДЬ ============
@@ -259,33 +319,166 @@ def add_to_history(prompt: str) -> None:
     HISTORY_FILE.write_text(json.dumps(h, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def generate_next_task() -> str:
-    direction = get_direction()
+# ============ ПЛАНИРОВЩИК ============
+
+def generate_ideas(direction: str, count: int = 10) -> list:
     if not direction:
-        return ""
-    history = load_history()
-    recent = "\n".join(f"- {h['prompt']}" for h in history[-10:]) or "(пусто)"
+        return []
 
     meta = f"""Ты геймдизайнер Godot-игры (2D top-down).
 
-НАПРАВЛЕНИЕ: {direction}
+ОБЩАЯ ЦЕЛЬ:
+{direction}
 
-СДЕЛАНО:
-{recent}
+Разбей эту цель на {count} КРУПНЫХ ИДЕЙ — блоков работ.
+Каждая идея — это раздел игры (например, "главное меню", "система стрельбы", "зомби и ИИ").
 
-Придумай ОДНУ конкретную задачу под направление. Ответь РОВНО одной строкой без кавычек."""
+ПРАВИЛА:
+- Идея = тема, которую можно раскрыть в 3-10 задачах.
+- Не повторяйся.
+- Идёшь по логике: сначала фундамент, потом фичи.
+- Формат: одна идея на строку, без нумерации, без кавычек.
+
+Пример:
+главное меню и навигация
+система движения игрока
+система стрельбы и оружия
+зомби и ИИ
+инвентарь и лут
+HUD и интерфейс
+"""
 
     try:
         r = run_codex_only(meta, None)
-        ans = r.get("answer", "").strip()
-        for line in ans.split("\n"):
-            line = line.strip().strip('"').strip("-").strip()
-            if len(line) > 10 and not line.startswith("["):
-                return line
-        return ""
+        raw = r.get("answer", "").strip()
+        ideas = []
+        for line in raw.split("\n"):
+            line = line.strip()
+            line = re.sub(r"^\d+[\.\)]\s*", "", line)
+            line = line.strip('"').strip("'").strip("-").strip()
+            if len(line) > 5 and not line.startswith("[") and not line.startswith("```"):
+                ideas.append(line)
+        return ideas[:count]
     except Exception as e:
-        log(f"generate: {e}")
+        log(f"generate_ideas: {e}")
+        return []
+
+
+def generate_tasks_for_idea(idea: str, direction: str, count: int = 8) -> list:
+    meta = f"""Ты программист Godot 4.
+
+ОБЩАЯ ЦЕЛЬ ПРОЕКТА:
+{direction}
+
+ТЕКУЩАЯ ИДЕЯ:
+{idea}
+
+Разбей эту идею на {count} КОНКРЕТНЫХ МАЛЕНЬКИХ задач.
+Каждая задача изменяет 1-2 файла. Каждая начинается с глагола.
+
+ПРАВИЛА:
+- Одна задача = одно действие.
+- Не пиши "сделай всю систему" — только конкретика.
+- Формат: одна задача на строку.
+
+Пример для идеи "главное меню":
+создай сцену MainMenu.tscn с фоном ColorRect
+добавь в MainMenu.tscn кнопку Играть по центру
+добавь в MainMenu.tscn кнопку Настройки под Играть
+добавь в MainMenu.tscn кнопку Выход внизу
+создай скрипт main_menu.gd
+добавь в main_menu.gd обработчик кнопки Играть
+"""
+
+    try:
+        r = run_codex_only(meta, None)
+        raw = r.get("answer", "").strip()
+        tasks = []
+        for line in raw.split("\n"):
+            line = line.strip()
+            line = re.sub(r"^\d+[\.\)]\s*", "", line)
+            line = line.strip('"').strip("'").strip("-").strip()
+            if len(line) > 8 and not line.startswith("[") and not line.startswith("```"):
+                tasks.append(line)
+        return tasks[:count]
+    except Exception as e:
+        log(f"generate_tasks: {e}")
+        return []
+
+
+def save_ideas(ideas: list) -> None:
+    IDEAS_FILE.write_text(json.dumps(ideas, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_ideas() -> list:
+    if IDEAS_FILE.exists():
+        try:
+            return json.loads(IDEAS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def pop_idea() -> str:
+    ideas = load_ideas()
+    if not ideas:
         return ""
+    idea = ideas.pop(0)
+    save_ideas(ideas)
+    return idea
+
+
+def save_subtasks(tasks: list) -> None:
+    SUBTASKS_FILE.write_text(json.dumps(tasks, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_subtasks() -> list:
+    if SUBTASKS_FILE.exists():
+        try:
+            return json.loads(SUBTASKS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def pop_subtask() -> str:
+    tasks = load_subtasks()
+    if not tasks:
+        return ""
+    task = tasks.pop(0)
+    save_subtasks(tasks)
+    return task
+
+
+def get_next_task_smart() -> str:
+    direction = get_direction()
+
+    subtask = pop_subtask()
+    if subtask:
+        return subtask
+
+    idea = pop_idea()
+    if idea:
+        log(f"[planner] разбиваю идею: {idea}")
+        tasks = generate_tasks_for_idea(idea, direction, 8)
+        if tasks:
+            save_subtasks(tasks)
+            log(f"[planner] {len(tasks)} подзадач")
+            return pop_subtask() or idea
+        return idea
+
+    if direction:
+        log("[planner] генерирую идеи")
+        ideas = generate_ideas(direction, 10)
+        if ideas:
+            save_ideas(ideas)
+            idea = pop_idea()
+            tasks = generate_tasks_for_idea(idea, direction, 8)
+            if tasks:
+                save_subtasks(tasks)
+                return pop_subtask() or idea
+
+    return ""
 
 
 # ============ ПОИСК ФАЙЛОВ ============
@@ -465,7 +658,6 @@ def _run_codex(prompt: str, image_paths: list = None) -> dict:
     cmd.append(prompt)
 
     log(f"run_codex: {' '.join(cmd[:8])} ...")
-    log(f"run_codex: images = {len(image_paths) if image_paths else 0}")
 
     try:
         r = subprocess.run(
@@ -510,7 +702,6 @@ async def download_attachment_async(file_obj, custom_name: str = None) -> Path:
 
 
 def classify_attachment(name: str) -> str:
-    """Возвращает: 'image', 'video', 'text_prompt', 'zip', 'other'."""
     ext = Path(name).suffix.lower()
     if ext in IMAGE_EXTS:
         return "image"
