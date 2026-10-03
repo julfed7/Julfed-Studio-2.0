@@ -25,9 +25,14 @@ from build import (
     load_queue, enqueue_task, pop_task, complete_task, clear_queue,
     set_loop_state, get_loop_state,
     set_direction, get_direction,
-    generate_next_task, add_to_history,
-    git_commit_push,
+    generate_ideas, generate_tasks_for_idea,
+    save_ideas, load_ideas, pop_idea,
+    save_subtasks, load_subtasks, pop_subtask,
+    get_next_task_smart,
+    add_to_history,
+    git_commit_push, ensure_git_config,
     download_latest_apk, get_latest_release_tag, wait_for_new_release,
+    trigger_build_workflow,
     PROJECT_PATH,
 )
 
@@ -44,8 +49,6 @@ GITHUB_REPO = os.getenv("GITHUB_REPO", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
 
-# ============ УТИЛИТЫ ============
-
 def escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -59,7 +62,6 @@ def human_size(n: int) -> str:
 
 
 def _consume(user_id: int) -> dict:
-    """Забирает ВСЕ вложения пользователя и очищает состояние."""
     state = user_states.get(user_id, {})
     result = {
         "text": "",
@@ -75,7 +77,6 @@ def _consume(user_id: int) -> dict:
 
 
 def _peek(user_id: int) -> dict:
-    """Смотрит вложения, не удаляя."""
     state = user_states.get(user_id, {})
     return {
         "has_prompt": "pending_prompt" in state,
@@ -87,7 +88,6 @@ def _peek(user_id: int) -> dict:
 
 
 def _media_for_codex(a: dict) -> list:
-    """Codex --image принимает и фото, и видео."""
     return a["images"] + a["videos"]
 
 
@@ -111,24 +111,26 @@ def _attach_line(a: dict) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "🎮 <b>Студия Cubism (Termux)</b>\n\n"
+        "<b>Планирование:</b>\n"
+        "• <code>/direction &lt;цель&gt;</code> — задать цель\n"
+        "• <code>/plan_ideas</code> — Luna разобьёт на идеи\n"
+        "• <code>/show_ideas</code> — показать идеи и подзадачи\n\n"
         "<b>Автопилот:</b>\n"
-        "• <code>/direction &lt;текст&gt;</code>\n"
-        "• <code>/autopilot</code>\n"
-        "• <code>/stop</code>\n\n"
-        "<b>Задачи:</b>\n"
-        "• <code>/task &lt;промпт&gt;</code>\n"
-        "• <code>/build &lt;промпт&gt;</code>\n"
+        "• <code>/autopilot</code> — Luna сама делает всё\n"
+        "• <code>/stop</code> — остановить\n\n"
+        "<b>Сборка:</b>\n"
+        "• <code>/build_apk</code> — собрать APK через GitHub\n\n"
+        "<b>Задачи вручную:</b>\n"
+        "• <code>/task &lt;промпт&gt;</code> / <code>/build &lt;промпт&gt;</code>\n"
         "• <code>/queue</code> / <code>/work</code> / <code>/loop</code> / <code>/clear</code>\n\n"
         "<b>Codex:</b> <code>/luna &lt;промпт&gt;</code>\n\n"
         "<b>Файлы:</b>\n"
         "• <code>/get &lt;файл&gt;</code> / <code>/download_project</code>\n"
         "• <code>/upload_project</code> / <code>/upload_to &lt;путь&gt;</code>\n\n"
-        "<b>📎 Вложения — работают во ВСЕХ командах:</b>\n"
-        "• Любой <b>.txt .md .gd .json .py</b> → текстовый промпт\n"
-        "• Любое <b>фото</b> → идёт в Codex\n"
-        "• Любое <b>видео</b> → идёт в Codex\n"
-        "• Любой <b>.zip</b> → замена проекта или распаковка\n\n"
-        "Просто отправь файл → потом напиши команду.\n\n"
+        "<b>📎 Вложения — во ВСЕХ командах:</b>\n"
+        "• .txt .md .gd .json .py → промпт\n"
+        "• фото / видео → Codex\n"
+        "• .zip → замена проекта\n\n"
         "<b>Прочее:</b> <code>/model</code>, <code>/status</code>, <code>/cancel</code>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
@@ -183,6 +185,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     direction = get_direction()
     dir_text = (direction[:150] + "...") if len(direction) > 150 else (direction or "<i>не задано</i>")
 
+    ideas = load_ideas()
+    subtasks = load_subtasks()
+
     p = _peek(update.effective_user.id)
     att = []
     if p["has_prompt"]:
@@ -201,6 +206,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"🤖 <code>{CONFIG.get('model', '?')}</code> / <code>{CONFIG.get('effort', '?')}</code>",
         f"♻️ Автопилот: <b>{'АКТИВЕН' if get_loop_state() else 'выкл'}</b>",
         f"📋 Очередь: ⏳ {pending} | 🔄 {in_prog} | ✅ {done}",
+        f"💡 Идей: {len(ideas)} | 📌 Подзадач: {len(subtasks)}",
         f"🎯 Направление: {dir_text}",
         f"🐙 GitHub: <code>{GITHUB_REPO or 'не задан'}</code>",
         f"📁 Проект: <code>{escape_html(str(PROJECT_PATH))}</code>",
@@ -229,17 +235,75 @@ async def cmd_direction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         else:
             await update.message.reply_text(
                 "🎯 Не задано.\n\n"
-                "<code>/direction Сделай игру как Brawl Stars</code>\n"
-                "Или отправь <b>любой .txt</b> → потом <code>/direction</code>",
+                "<code>/direction Сделай игру как Brawl Stars</code>",
                 parse_mode="HTML",
             )
         return
 
     await asyncio.to_thread(set_direction, text)
     await update.message.reply_text(
-        f"✅ Задано:\n\n<i>{escape_html(text[:500])}</i>\n\nЗапусти: <code>/autopilot</code>",
+        f"✅ Задано:\n\n<i>{escape_html(text[:500])}</i>\n\n"
+        f"Дальше: <code>/plan_ideas</code> или <code>/autopilot</code>",
         parse_mode="HTML",
     )
+
+
+# ============ ПЛАНИРОВАНИЕ ============
+
+async def cmd_plan_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    direction = get_direction()
+    if not direction:
+        await update.message.reply_text(
+            "❌ Сначала: <code>/direction &lt;текст&gt;</code>", parse_mode="HTML"
+        )
+        return
+
+    status = await update.message.reply_text(
+        "🧠 Luna разбивает направление на идеи (1–2 мин)..."
+    )
+
+    ideas = await asyncio.to_thread(generate_ideas, direction, 10)
+
+    if not ideas:
+        await status.edit_text("❌ Luna не смогла. Попробуй другое направление.")
+        return
+
+    await asyncio.to_thread(save_ideas, ideas)
+
+    lines = [f"💡 <b>Идеи ({len(ideas)}):</b>\n"]
+    for i, idea in enumerate(ideas, 1):
+        lines.append(f"{i}. {escape_html(idea)}")
+
+    await status.edit_text("\n".join(lines), parse_mode="HTML")
+    await update.message.reply_text(
+        "▶️ Запустить: <code>/autopilot</code>\n"
+        "📋 Показать: <code>/show_ideas</code>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_show_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ideas = await asyncio.to_thread(load_ideas)
+    subtasks = await asyncio.to_thread(load_subtasks)
+
+    if not ideas and not subtasks:
+        await update.message.reply_text("📋 Планов нет.")
+        return
+
+    lines = []
+    if ideas:
+        lines.append(f"💡 <b>Идеи ({len(ideas)}):</b>\n")
+        for i, idea in enumerate(ideas, 1):
+            lines.append(f"{i}. {escape_html(idea)}")
+
+    if subtasks:
+        lines.append(f"\n📌 <b>Подзадачи ({len(subtasks)}):</b>\n")
+        for i, t in enumerate(subtasks[:10], 1):
+            lines.append(f"{i}. {escape_html(t)}")
+        if len(subtasks) > 10:
+            lines.append(f"<i>...и ещё {len(subtasks) - 10}</i>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ============ ЗАДАЧИ ============
@@ -254,12 +318,7 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     media = _media_for_codex(a)
 
     if not prompt and not media:
-        await update.message.reply_text(
-            "❌ Пусто.\n\n"
-            "• <code>/task добавь стенда</code>\n"
-            "• Или отправь <b>ЛЮБОЙ файл</b> → потом <code>/task</code>",
-            parse_mode="HTML",
-        )
+        await update.message.reply_text("❌ Пусто.", parse_mode="HTML")
         return
 
     if not prompt:
@@ -270,9 +329,7 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pending = len([t for t in queue if t.get("status") == "pending"])
     info = _attach_line(a)
     await update.message.reply_text(
-        f"✅ Задача #{task_id} добавлена.\n"
-        f"📎 {info}\n📋 В очереди: <b>{pending}</b>\n\n"
-        f"Запустить: <code>/loop</code> или <code>/autopilot</code>",
+        f"✅ Задача #{task_id} добавлена.\n📎 {info}\n📋 В очереди: <b>{pending}</b>",
         parse_mode="HTML",
     )
 
@@ -288,9 +345,7 @@ async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     media = _media_for_codex(a)
 
     if not prompt and not media:
-        await update.message.reply_text(
-            "❌ Пусто.\n\n<code>/build добавь стенда</code>", parse_mode="HTML"
-        )
+        await update.message.reply_text("❌ Пусто.", parse_mode="HTML")
         return
 
     if not prompt:
@@ -361,48 +416,23 @@ async def _process_one_task(update: Update, task: dict) -> bool:
 
     commit_msg = f"[auto] {prompt[:60]}"
     ok, git_out = await asyncio.to_thread(git_commit_push, commit_msg)
+
     if not ok:
         await status.edit_text(
-            f"⚠️ Git push не удался:\n<pre>{escape_html(git_out[-400:])}</pre>",
+            f"❌ <b>Задача #{task_id} — Git НЕ прошёл</b>\n"
+            f"<pre>{escape_html(git_out[-400:])}</pre>",
             parse_mode="HTML",
         )
-    else:
-        await status.edit_text(
-            f"✅ <b>Задача #{task_id}</b>\nКод запушен.\n\n<pre>{escape_html(short)}</pre>",
-            parse_mode="HTML",
-        )
-
-    if not (GITHUB_REPO and GITHUB_TOKEN):
-        await update.message.reply_text("⚠️ GITHUB_REPO / GITHUB_TOKEN не заданы.")
         await asyncio.to_thread(complete_task, task_id)
-        return True
+        return False
 
-    prev_tag = await asyncio.to_thread(get_latest_release_tag, GITHUB_REPO, GITHUB_TOKEN)
-    await update.message.reply_text("⏳ Жду APK из GitHub Actions (до 15 мин)...")
-
-    new_tag = await asyncio.to_thread(
-        wait_for_new_release, GITHUB_REPO, GITHUB_TOKEN, prev_tag, 900
+    await status.edit_text(
+        f"✅ <b>Задача #{task_id}</b>\n"
+        f"Код запушен в GitHub.\n\n"
+        f"<pre>{escape_html(short)}</pre>\n\n"
+        f"<i>APK соберётся по /build_apk</i>",
+        parse_mode="HTML",
     )
-    if not new_tag:
-        await update.message.reply_text("⚠️ APK не пришёл за 15 мин.")
-        await asyncio.to_thread(complete_task, task_id)
-        return False
-
-    apk_path = Path(tempfile.gettempdir()) / f"build_{new_tag}.apk"
-    got = await asyncio.to_thread(download_latest_apk, GITHUB_REPO, GITHUB_TOKEN, apk_path)
-    if not got:
-        await update.message.reply_text(f"⚠️ Релиз {new_tag} есть, но APK не скачался.")
-        await asyncio.to_thread(complete_task, task_id)
-        return False
-
-    size_mb = apk_path.stat().st_size / (1024 * 1024)
-    with open(apk_path, "rb") as f:
-        await update.message.reply_document(
-            document=f,
-            filename=f"cubism_{new_tag}.apk",
-            caption=f"✅ <b>Задача #{task_id}</b>\n📦 {new_tag}\n💾 {size_mb:.1f} MB",
-            parse_mode="HTML",
-        )
 
     await asyncio.to_thread(complete_task, task_id)
     return True
@@ -422,14 +452,24 @@ async def _loop_queue(update: Update) -> None:
     set_loop_state(True)
     await update.message.reply_text("♻️ Выполняю очередь...")
 
+    ok_count = 0
+    fail_count = 0
+
     while loop_running:
         task = await asyncio.to_thread(pop_task)
         if not task:
-            await update.message.reply_text("✅ Очередь пуста.")
+            await update.message.reply_text(
+                f"✅ Очередь пуста.\n📊 Успешно: {ok_count} | Ошибок: {fail_count}"
+            )
             break
         try:
-            await _process_one_task(update, task)
+            success = await _process_one_task(update, task)
+            if success:
+                ok_count += 1
+            else:
+                fail_count += 1
         except Exception as e:
+            fail_count += 1
             await update.message.reply_text(
                 f"❌ Ошибка #{task.get('id')}: {escape_html(str(e))}",
                 parse_mode="HTML",
@@ -462,44 +502,85 @@ async def _autopilot_loop(update: Update) -> None:
     loop_running = True
     set_loop_state(True)
     await update.message.reply_text(
-        f"🚀 <b>Автопилот запущен</b>\n\n🎯 <i>{escape_html(direction[:200])}</i>",
+        f"🚀 <b>Автопилот запущен</b>\n\n"
+        f"🎯 <i>{escape_html(direction[:200])}</i>\n\n"
+        f"Luna будет:\n"
+        f"1. Генерировать идеи\n"
+        f"2. Разбивать их на задачи\n"
+        f"3. Делать задачи\n\n"
+        f"APK — по /build_apk\n"
+        f"Остановить: /stop",
         parse_mode="HTML",
     )
 
     iteration = 0
+    ok_count = 0
+    fail_count = 0
+    consecutive_fails = 0
+
     while loop_running:
         iteration += 1
+
         task = await asyncio.to_thread(pop_task)
 
         if not task:
-            await update.message.reply_text(
-                f"🧠 Итерация {iteration} — Luna думает...", parse_mode="HTML"
-            )
-            new_prompt = await asyncio.to_thread(generate_next_task)
+            new_prompt = await asyncio.to_thread(get_next_task_smart)
+
             if not new_prompt:
-                await update.message.reply_text("⚠️ Luna не придумала. Жду 5 мин.")
-                await asyncio.sleep(300)
+                consecutive_fails += 1
+                await update.message.reply_text(
+                    f"⚠️ Luna не спланировала ({consecutive_fails}/3). Жду 2 мин."
+                )
+                if consecutive_fails >= 3:
+                    await update.message.reply_text(
+                        "🛑 Luna не может планировать. Автопилот остановлен.",
+                        parse_mode="HTML",
+                    )
+                    break
+                await asyncio.sleep(120)
                 continue
+
+            consecutive_fails = 0
             await update.message.reply_text(
-                f"💡 <b>Luna придумала:</b>\n<i>{escape_html(new_prompt)}</i>",
+                f"💡 <b>Задача {iteration}:</b>\n<i>{escape_html(new_prompt)}</i>",
                 parse_mode="HTML",
             )
             await asyncio.to_thread(add_to_history, new_prompt)
             task = {"id": -iteration, "prompt": new_prompt, "images": [], "status": "auto"}
 
         try:
-            await _process_one_task(update, task)
+            success = await _process_one_task(update, task)
+            if success:
+                ok_count += 1
+                consecutive_fails = 0
+            else:
+                fail_count += 1
+                consecutive_fails += 1
         except Exception as e:
+            fail_count += 1
+            consecutive_fails += 1
             await update.message.reply_text(
                 f"❌ Ошибка: {escape_html(str(e))}", parse_mode="HTML"
             )
-            await asyncio.sleep(30)
+
+        if consecutive_fails >= 3:
+            await update.message.reply_text(
+                "🛑 3 ошибки подряд. Возможно, кредиты Luna кончились.\n"
+                "Автопилот остановлен.",
+                parse_mode="HTML",
+            )
+            break
 
         await asyncio.sleep(5)
 
     loop_running = False
     set_loop_state(False)
-    await update.message.reply_text("⏹ Автопилот остановлен.")
+    await update.message.reply_text(
+        f"⏹ <b>Автопилот остановлен</b>\n"
+        f"📊 Успешно: {ok_count} | Ошибок: {fail_count}\n\n"
+        f"Собрать APK: <code>/build_apk</code>",
+        parse_mode="HTML",
+    )
 
 
 async def cmd_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -530,6 +611,48 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("⏹ Остановлено.")
 
 
+# ============ СБОРКА APK ============
+
+async def cmd_build_apk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not (GITHUB_REPO and GITHUB_TOKEN):
+        await update.message.reply_text("❌ GITHUB_REPO / GITHUB_TOKEN не заданы.")
+        return
+
+    status = await update.message.reply_text("🚀 Запускаю сборку APK на GitHub...")
+
+    prev_tag = await asyncio.to_thread(get_latest_release_tag, GITHUB_REPO, GITHUB_TOKEN)
+
+    ok = await asyncio.to_thread(trigger_build_workflow, GITHUB_REPO, GITHUB_TOKEN)
+    if not ok:
+        await status.edit_text("❌ Не удалось запустить workflow. Проверь токен.")
+        return
+
+    await status.edit_text("⏳ Сборка запущена. Жду APK (до 15 мин)...")
+
+    new_tag = await asyncio.to_thread(
+        wait_for_new_release, GITHUB_REPO, GITHUB_TOKEN, prev_tag, 900
+    )
+    if not new_tag:
+        await status.edit_text("⚠️ APK не пришёл за 15 мин. Проверь Actions.")
+        return
+
+    apk_path = Path(tempfile.gettempdir()) / f"build_{new_tag}.apk"
+    got = await asyncio.to_thread(download_latest_apk, GITHUB_REPO, GITHUB_TOKEN, apk_path)
+    if not got:
+        await status.edit_text(f"⚠️ Релиз {new_tag} есть, но APK не скачался.")
+        return
+
+    size_mb = apk_path.stat().st_size / (1024 * 1024)
+    with open(apk_path, "rb") as f:
+        await update.message.reply_document(
+            document=f,
+            filename=f"cubism_{new_tag}.apk",
+            caption=f"✅ <b>Сборка готова</b>\n📦 {new_tag}\n💾 {size_mb:.1f} MB",
+            parse_mode="HTML",
+        )
+    await status.delete()
+
+
 # ============ CODEX ============
 
 async def cmd_luna(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -543,9 +666,7 @@ async def cmd_luna(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not prompt and not media:
         await update.message.reply_text(
-            "❌ <code>/luna &lt;промпт&gt;</code>\n"
-            "Или отправь <b>любой файл</b> → потом <code>/luna</code>.",
-            parse_mode="HTML",
+            "❌ <code>/luna &lt;промпт&gt;</code>", parse_mode="HTML"
         )
         return
 
@@ -661,26 +782,21 @@ async def cmd_download_project(update: Update, context: ContextTypes.DEFAULT_TYP
 # ============ ВЛОЖЕНИЯ ============
 
 async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Универсальный приём ЛЮБЫХ вложений: фото, видео, документы."""
     msg = update.message
     user_id = update.effective_user.id
     state = user_states.setdefault(user_id, {})
 
-    # --- Фото ---
     if msg.photo:
         file_obj = await msg.photo[-1].get_file()
         name = f"photo_{msg.photo[-1].file_unique_id}.jpg"
         local = await download_attachment_async(file_obj, name)
         state.setdefault("pending_images", []).append(str(local))
         await msg.reply_text(
-            f"🖼 Фото сохранено ({human_size(local.stat().st_size)}).\n\n"
-            f"Отправь любую команду: <code>/luna</code>, <code>/task</code>, "
-            f"<code>/build</code>, <code>/direction</code>",
+            f"🖼 Фото ({human_size(local.stat().st_size)}).\nОтправь команду.",
             parse_mode="HTML",
         )
         return
 
-    # --- Видео ---
     if msg.video:
         file_obj = await msg.video.get_file()
         name = f"video_{msg.video.file_unique_id}.mp4"
@@ -689,22 +805,16 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         if local.stat().st_size > 20 * 1024 * 1024:
             await msg.reply_text(
-                f"⚠️ Видео {size_mb:.1f} MB — больше 20 МБ.\n"
-                f"Telegram не отдаёт такое боту. Обрежь или сожми.",
-                parse_mode="HTML",
+                f"⚠️ Видео {size_mb:.1f} MB — больше 20 МБ.", parse_mode="HTML"
             )
             return
 
         state.setdefault("pending_videos", []).append(str(local))
         await msg.reply_text(
-            f"🎬 Видео сохранено ({size_mb:.1f} MB).\n\n"
-            f"Отправь любую команду: <code>/luna</code>, <code>/task</code>, "
-            f"<code>/build</code>",
-            parse_mode="HTML",
+            f"🎬 Видео ({size_mb:.1f} MB).\nОтправь команду.", parse_mode="HTML"
         )
         return
 
-    # --- Документ ---
     if msg.document:
         file_obj = await msg.document.get_file()
         name = msg.document.file_name or f"doc_{msg.document.file_unique_id}"
@@ -715,35 +825,34 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if kind == "image":
             state.setdefault("pending_images", []).append(str(local))
             await msg.reply_text(
-                f"🖼 Картинка: <code>{escape_html(name)}</code> ({size})\n"
-                f"Отправь команду.",
+                f"🖼 Картинка: <code>{escape_html(name)}</code> ({size})",
                 parse_mode="HTML",
             )
-
+        elif kind == "video":
+            state.setdefault("pending_videos", []).append(str(local))
+            await msg.reply_text(
+                f"🎬 Видео: <code>{escape_html(name)}</code> ({size})",
+                parse_mode="HTML",
+            )
         elif kind == "text_prompt":
             state["pending_prompt"] = str(local)
             state["prompt_name"] = name
             await msg.reply_text(
-                f"📝 Текстовый промпт: <code>{escape_html(name)}</code> ({size})\n"
-                f"Отправь команду без текста — файл станет промптом.",
+                f"📝 Промпт: <code>{escape_html(name)}</code> ({size})\n"
+                f"Отправь команду без текста.",
                 parse_mode="HTML",
             )
-
         elif kind == "zip":
             state.setdefault("pending_zips", []).append(str(local))
             await msg.reply_text(
-                f"📦 ZIP: <code>{escape_html(name)}</code> ({size})\n\n"
-                f"• <code>/upload_project</code> — заменить проект\n"
-                f"• <code>/upload_to &lt;путь&gt;</code> — распаковать",
+                f"📦 ZIP: <code>{escape_html(name)}</code>\n"
+                f"<code>/upload_project</code> или <code>/upload_to &lt;путь&gt;</code>",
                 parse_mode="HTML",
             )
-
         else:
             state.setdefault("pending_files", []).append(str(local))
             await msg.reply_text(
-                f"📎 Файл: <code>{escape_html(name)}</code> ({size})\n"
-                f"Отправь команду (<code>/luna</code>, <code>/task</code>) "
-                f"или <code>/upload_to &lt;путь&gt;</code>",
+                f"📎 Файл: <code>{escape_html(name)}</code> ({size})",
                 parse_mode="HTML",
             )
         return
@@ -754,13 +863,12 @@ async def cmd_upload_project(update: Update, context: ContextTypes.DEFAULT_TYPE)
     state = user_states.get(user_id, {})
 
     zips = state.get("pending_zips", [])
-    if not zips and "pending_upload" not in state:
+    if not zips:
         await update.message.reply_text("❌ Сначала отправь ZIP-архив.")
         return
 
-    zip_path = zips[0] if zips else state["pending_upload"]
     status = await update.message.reply_text("📦 Распаковываю в проект...")
-    result = await asyncio.to_thread(upload_project_zip, zip_path)
+    result = await asyncio.to_thread(upload_project_zip, zips[0])
 
     if result["ok"]:
         await status.edit_text(
@@ -776,12 +884,7 @@ async def cmd_upload_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = update.effective_user.id
     state = user_states.get(user_id, {})
 
-    # Берём первый доступный файл
-    candidates = (
-        state.get("pending_zips", [])
-        + state.get("pending_files", [])
-        + ([state["pending_upload"]] if "pending_upload" in state else [])
-    )
+    candidates = state.get("pending_zips", []) + state.get("pending_files", [])
     if not candidates:
         await update.message.reply_text("❌ Сначала отправь файл.")
         return
@@ -817,25 +920,38 @@ async def cmd_upload_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ============ ЗАПУСК ============
 
 def main() -> None:
+    # Фикс Python 3.14
+    import asyncio as _asyncio
+    try:
+        _asyncio.get_event_loop()
+    except RuntimeError:
+        _asyncio.set_event_loop(_asyncio.new_event_loop())
+
+    try:
+        ensure_git_config()
+        logger.info("Git настроен")
+    except Exception as e:
+        logger.warning(f"Git config: {e}")
+
     request = HTTPXRequest(
         connect_timeout=30.0, read_timeout=30.0,
         write_timeout=30.0, pool_timeout=30.0,
     )
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(request).build()
 
-    # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
-    # Направление / автопилот
     app.add_handler(CommandHandler("direction", cmd_direction))
+    app.add_handler(CommandHandler("plan_ideas", cmd_plan_ideas))
+    app.add_handler(CommandHandler("show_ideas", cmd_show_ideas))
     app.add_handler(CommandHandler("autopilot", cmd_autopilot))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("build_apk", cmd_build_apk))
 
-    # Очередь
     app.add_handler(CommandHandler("task", cmd_task))
     app.add_handler(CommandHandler("build", cmd_build))
     app.add_handler(CommandHandler("queue", cmd_queue))
@@ -843,16 +959,13 @@ def main() -> None:
     app.add_handler(CommandHandler("loop", cmd_loop))
     app.add_handler(CommandHandler("clear", cmd_clear))
 
-    # Codex
     app.add_handler(CommandHandler("luna", cmd_luna))
 
-    # Файлы
     app.add_handler(CommandHandler("get", cmd_get))
     app.add_handler(CommandHandler("download_project", cmd_download_project))
     app.add_handler(CommandHandler("upload_project", cmd_upload_project))
     app.add_handler(CommandHandler("upload_to", cmd_upload_to))
 
-    # Универсальный приём вложений — фото, видео, документы
     app.add_handler(MessageHandler(
         filters.PHOTO | filters.VIDEO | filters.Document.ALL,
         handle_attachment,
