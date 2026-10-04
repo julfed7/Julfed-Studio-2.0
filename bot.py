@@ -1,7 +1,10 @@
 import asyncio
+import json
 import logging
 import os
+import re
 import tempfile
+import time
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -111,7 +114,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🎮 <b>Студия Cubism (Termux)</b>\n\n"
         "<b>Главное:</b>\n"
         "• <code>/direction &lt;цель&gt;</code> — задать цель\n"
-        "• <code>/autopilot</code> — Codex делает ВСЁ за один раз\n"
+        "• <code>/autopilot [N]</code> — Codex сам придумывает и делает новые идеи под направление (N — макс. идей)\n"
         "• <code>/build_apk</code> — собрать APK\n"
         "• <code>/stop</code> — остановить\n\n"
         "<b>Ручные задачи:</b>\n"
@@ -125,7 +128,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• .txt .md .gd → промпт\n"
         "• фото / видео → Codex\n"
         "• .zip → замена проекта\n\n"
-        "<b>Прочее:</b> <code>/model</code>, <code>/credits</code>, <code>/limit5h</code>, <code>/credits_limit</code>, <code>/credits_reset</code>, <code>/status</code>, <code>/cancel</code>"
+        "<b>Прочее:</b> <code>/model</code>, <code>/effort</code>, <code>/credits</code>, <code>/limit5h</code>, <code>/credits_limit</code>, <code>/credits_reset</code>, <code>/status</code>, <code>/cancel</code>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -141,21 +144,28 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ============ МОДЕЛЬ ============
 
-DEFAULT_MODELS = ["gpt-5.6-luna", "gpt-5.6-sol"]
-EFFORTS = ["low", "medium", "high"]
+DEFAULT_MODELS = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-luna", "gpt-6.1-sol"]
+EFFORTS = ["low", "medium", "high", "xhigh", "ultra"]
+EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "ultra"]
+EFFORT_ALLOWED = set(EFFORT_ORDER)
 
 
 def _model_keyboard() -> InlineKeyboardMarkup:
     from config import CONFIG
     cur_m = CONFIG.get("model", "gpt-5.6-luna")
     cur_e = CONFIG.get("effort", "high")
-    models = list(CONFIG.get("models", DEFAULT_MODELS))
+    models = list(DEFAULT_MODELS)
+    for m in CONFIG.get("models", []):
+        if m not in models:
+            models.append(m)
     if cur_m not in models:
         models.insert(0, cur_m)
     rows = [[InlineKeyboardButton(("✅ " if m == cur_m else "") + m, callback_data=f"model:{m}")]
             for m in models]
-    rows.append([InlineKeyboardButton(("✅ " if e == cur_e else "") + e, callback_data=f"effort:{e}")
-                 for e in EFFORTS])
+    ebtns = [InlineKeyboardButton(("✅ " if e == cur_e else "") + e, callback_data=f"effort:{e}")
+             for e in EFFORTS]
+    rows.append(ebtns[:3])
+    rows.append(ebtns[3:])
     return InlineKeyboardMarkup(rows)
 
 
@@ -164,7 +174,7 @@ def _model_text() -> str:
     return (
         f"🤖 Модель: <code>{CONFIG.get('model', 'gpt-5.6-luna')}</code>\n"
         f"⚙️ Усилие: <code>{CONFIG.get('effort', 'high')}</code>\n\n"
-        "Выбери кнопкой или напиши: <code>/model &lt;имя&gt; [low|medium|high]</code>"
+        "Выбери кнопкой или напиши: <code>/model &lt;имя&gt; [low|medium|high|xhigh|ultra]</code>"
     )
 
 
@@ -211,6 +221,62 @@ async def cb_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await q.edit_message_text(
             _model_text(), parse_mode="HTML", reply_markup=_model_keyboard()
+        )
+    except Exception:
+        pass
+
+
+def _effort_keyboard() -> InlineKeyboardMarkup:
+    from config import CONFIG
+    cur = CONFIG.get("effort", "high")
+    btns = [InlineKeyboardButton(("✅ " if e == cur else "") + e, callback_data=f"eff:{e}")
+            for e in EFFORTS]
+    return InlineKeyboardMarkup([btns[:3], btns[3:]])
+
+
+def _effort_text() -> str:
+    from config import CONFIG
+    return (
+        f"⚙️ Усилие рассуждения: <code>{CONFIG.get('effort', 'high')}</code>\n"
+        "low: быстро и дёшево, high/xhigh/ultra: глубже, но дороже по токенам.\n"
+        "Выбери кнопкой или: <code>/effort medium</code>"
+    )
+
+
+async def cmd_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from config import CONFIG, save_config
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            _effort_text(), parse_mode="HTML", reply_markup=_effort_keyboard()
+        )
+        return
+    value = args[0].strip().lower()
+    if value not in EFFORT_ALLOWED:
+        await update.message.reply_text(
+            "❌ Допустимо: " + ", ".join(EFFORT_ORDER)
+        )
+        return
+    CONFIG["effort"] = value
+    save_config(CONFIG)
+    await update.message.reply_text(
+        f"✅ Усилие: <code>{value}</code>", parse_mode="HTML"
+    )
+
+
+async def cb_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from config import CONFIG, save_config
+    q = update.callback_query
+    _, _, value = (q.data or "").partition(":")
+    if value not in EFFORT_ALLOWED:
+        await q.answer()
+        return
+    CONFIG["effort"] = value
+    save_config(CONFIG)
+    await q.answer("Сохранено")
+    try:
+        await q.edit_message_text(
+            _effort_text(), parse_mode="HTML", reply_markup=_effort_keyboard()
         )
     except Exception:
         pass
@@ -598,9 +664,78 @@ async def cmd_loop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio.create_task(_loop_queue(update))
 
 
-# ============ АВТОПИЛОТ (ОДИН ПРОМПТ) ============
+# ============ АВТОПИЛОТ (ЦИКЛАМИ) ============
 
-async def _autopilot_loop(update: Update) -> None:
+MAX_FAILS_IN_ROW = 3
+PAUSE_BETWEEN_CYCLES = 20  # секунд
+IDEAS_FILE = Path(__file__).parent / "ideas_log.json"
+IDEAS_IN_PROMPT = 40
+
+
+def _load_ideas() -> list:
+    try:
+        return json.loads(IDEAS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _save_idea(title: str) -> None:
+    ideas = _load_ideas()
+    ideas.append({"idea": title, "time": time.strftime("%Y-%m-%d %H:%M")})
+    try:
+        IDEAS_FILE.write_text(
+            json.dumps(ideas[-300:], indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _extract_idea(answer: str) -> str:
+    m = re.findall(r"^\s*IDEA:\s*(.+)$", answer or "", flags=re.MULTILINE)
+    if m:
+        return m[-1].strip()[:120]
+    first = (answer or "").strip().splitlines()[0] if (answer or "").strip() else "без названия"
+    return first[:120]
+
+
+def _build_cycle_prompt(direction: str, cycle: int) -> str:
+    done = [i["idea"] for i in _load_ideas()[-IDEAS_IN_PROMPT:]]
+    done_txt = "\n".join(f"- {t}" for t in done) if done else "(пока ничего)"
+    return f"""Ты геймдизайнер и разработчик Godot-проекта в текущей папке. Это итерация №{cycle} автопилота.
+
+НАПРАВЛЕНИЕ ИГРЫ:
+{direction}
+
+УЖЕ РЕАЛИЗОВАННЫЕ ИДЕИ (не повторяй их, не делай похожие):
+{done_txt}
+
+ЗАДАЧА ИТЕРАЦИИ:
+1. Изучи текущее состояние проекта (project.godot, scenes/, scripts/, autoloads/), пойми, что в игре уже есть.
+2. Придумай ОДНУ новую, интересную и конкретную идею, которая усиливает игру в рамках направления. Это может быть новая механика, враг или предмет, способность, уровень, событие, система прогрессии, интерфейс, звук, эффект или баланс. Чередуй категории, не зацикливайся на одном типе.
+3. Реализуй идею полностью: сцены, скрипты, подключение к существующему коду. Недостающие ресурсы (спрайты, звуки) заменяй заглушками. Не спрашивай ничего, делай.
+4. Не ломай существующее. После изменений проект должен запускаться без ошибок парсинга в .gd и .tscn.
+5. В конце ответа напиши 2-4 строки о том, что сделано, а последней строкой: IDEA: <короткое название идеи, до 10 слов>"""
+
+
+async def _wait_for_5h_reset(update: Update) -> bool:
+    """Если 5-часовой лимит исчерпан, ждёт сброса окна. False, если нажали /stop."""
+    global loop_running
+    notified = False
+    while loop_running:
+        u = get_usage_summary()
+        if u["w5_limit"] <= 0 or (u["w5_percent_used"] or 0) < 100 or not u["w5_active"]:
+            return True
+        if not notified:
+            mins = max(1, u["w5_resets_in"] // 60)
+            await update.message.reply_text(
+                f"⏸ 5-часовой лимит исчерпан. Пауза примерно {mins} мин до сброса окна."
+            )
+            notified = True
+        await asyncio.sleep(60)
+    return False
+
+
+async def _autopilot_loop(update: Update, max_cycles: int = 0) -> None:
     global loop_running
     direction = get_direction()
     if not direction:
@@ -612,109 +747,112 @@ async def _autopilot_loop(update: Update) -> None:
     loop_running = True
     set_loop_state(True)
 
+    limit_txt = f"Максимум проходов: {max_cycles}\n" if max_cycles else "Идеи идут бесконечно, пока не нажмёшь /stop\n"
     await update.message.reply_text(
-        f"🚀 <b>Автопилот запущен</b>\n\n"
+        f"🚀 <b>Автопилот запущен (циклами)</b>\n\n"
         f"🎯 <i>{escape_html(direction[:300])}</i>\n\n"
-        f"Codex работает над всей задачей за один раз.\n"
-        f"Это может занять 1–2 часа.\n\n"
-        f"Когда закончит — пришлю результат.\n"
+        f"{limit_txt}"
+        f"Каждый проход: Codex придумывает новую идею под направление, реализует её, коммит и пуш, затем следующая идея.\n"
         f"Собрать APK: /build_apk\n"
         f"Остановить: /stop",
         parse_mode="HTML",
     )
 
-    big_prompt = f"""Работай над Godot-проектом в текущей папке.
+    cycle = 0
+    fails = 0
+    reason = ""
 
-ОБЩАЯ ЗАДАЧА:
-{direction}
+    try:
+        while loop_running:
+            if max_cycles and cycle >= max_cycles:
+                reason = f"выполнено {cycle} проходов"
+                break
+            if not await _wait_for_5h_reset(update):
+                break
 
-ТРЕБОВАНИЯ:
-1. Изучи текущие файлы проекта (project.godot, scenes/, scripts/, autoloads/).
-2. Делай всё по порядку: сначала фундамент (сцены, скрипты), потом фичи.
-3. Изменяй столько файлов, сколько нужно. Не спрашивай — делай.
-4. Если чего-то не хватает (сцены, скрипты, спрайты) — создавай заглушки.
-5. Работай до тех пор, пока не сделаешь всё, что можешь.
-
-НЕ ОСТАНАВЛИВАЙСЯ НА ОДНОМ ФАЙЛЕ — делaй всё, что нужно для выполнения задачи."""
-
-    status = await update.message.reply_text(
-        "🧠 <b>Codex работает...</b>\n"
-        "Может занять 1–2 часа. Обновляю статус каждую минуту.\n\n"
-        "<i>0 минут...</i>",
-        parse_mode="HTML",
-    )
-
-    task = asyncio.create_task(asyncio.to_thread(run_codex, big_prompt, None))
-
-    elapsed = 0
-    while not task.done() and loop_running:
-        await asyncio.sleep(60)
-        elapsed += 1
-        try:
-            await status.edit_text(
-                f"🧠 <b>Codex работает...</b>\n"
-                f"Прошло: <b>{elapsed} мин</b>\n\n"
-                f"<i>Обновление каждую минуту.</i>",
+            cycle += 1
+            prompt = _build_cycle_prompt(direction, cycle)
+            status = await update.message.reply_text(
+                f"🧠 <b>Проход #{cycle}</b>: Codex работает...\n<i>0 мин</i>",
                 parse_mode="HTML",
             )
-        except Exception:
-            pass
+            task = asyncio.create_task(asyncio.to_thread(run_codex, prompt, None))
 
-    if not loop_running:
-        await update.message.reply_text("⏹ Остановлено пользователем.")
+            elapsed = 0
+            while not task.done() and loop_running:
+                await asyncio.sleep(60)
+                elapsed += 1
+                try:
+                    await status.edit_text(
+                        f"🧠 <b>Проход #{cycle}</b>: Codex работает...\n<i>{elapsed} мин</i>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+
+            if not loop_running:
+                reason = "остановлено пользователем"
+                break
+
+            try:
+                result = task.result()
+            except Exception as e:
+                result = {"ok": False, "answer": str(e)}
+
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
+            if not result or not result.get("ok"):
+                fails += 1
+                answer = (result.get("answer", "?") if result else "пусто")[:400]
+                await update.message.reply_text(
+                    f"❌ Проход #{cycle} упал ({fails}/{MAX_FAILS_IN_ROW}):\n"
+                    f"<pre>{escape_html(answer)}</pre>",
+                    parse_mode="HTML",
+                )
+                if fails >= MAX_FAILS_IN_ROW:
+                    reason = f"{MAX_FAILS_IN_ROW} ошибки подряд"
+                    break
+                await asyncio.sleep(PAUSE_BETWEEN_CYCLES)
+                continue
+
+            fails = 0
+            answer = result.get("answer", "") or ""
+            idea = _extract_idea(answer)
+            clean = re.sub(r"^\s*IDEA:.*$", "", answer, flags=re.MULTILINE).strip()
+
+            ok, git_out = await asyncio.to_thread(
+                git_commit_push, f"[auto] идея #{cycle}: {idea[:60]}"
+            )
+            if not ok:
+                await update.message.reply_text(
+                    f"❌ <b>Git НЕ прошёл</b> (проход #{cycle})\n"
+                    f"<pre>{escape_html(git_out[-400:])}</pre>",
+                    parse_mode="HTML",
+                )
+                reason = "ошибка git, остановил, чтобы не копить непушенные правки"
+                break
+
+            _save_idea(idea)
+            await update.message.reply_text(
+                f"💡 <b>Идея #{cycle}: {escape_html(idea)}</b>\n"
+                f"✅ Реализована и запушена\n\n"
+                f"<pre>{escape_html(clean[:600])}</pre>",
+                parse_mode="HTML",
+            )
+
+            await asyncio.sleep(PAUSE_BETWEEN_CYCLES)
+    finally:
         loop_running = False
         set_loop_state(False)
-        return
-
-    try:
-        result = task.result()
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Ошибка Codex: {escape_html(str(e))}", parse_mode="HTML"
-        )
-        loop_running = False
-        set_loop_state(False)
-        return
-
-    if not result or not result.get("ok"):
-        answer = (result.get("answer", "?") if result else "пусто")[:500]
-        await update.message.reply_text(
-            f"❌ Codex упал:\n<pre>{escape_html(answer)}</pre>", parse_mode="HTML"
-        )
-        loop_running = False
-        set_loop_state(False)
-        return
-
-    answer = result.get("answer", "")
-    short = answer[:800] if len(answer) > 800 else answer
 
     await update.message.reply_text(
-        "📦 Codex закончил. Коммичу изменения в GitHub..."
+        f"🏁 <b>Автопилот завершён</b>: {reason or 'остановлен'}\n"
+        f"Проходов: {cycle}\n\nСобрать APK: <code>/build_apk</code>",
+        parse_mode="HTML",
     )
-
-    commit_msg = f"[auto] {direction[:60]}"
-    ok, git_out = await asyncio.to_thread(git_commit_push, commit_msg)
-
-    if not ok:
-        await update.message.reply_text(
-            f"❌ <b>Git НЕ прошёл</b>\n<pre>{escape_html(git_out[-400:])}</pre>",
-            parse_mode="HTML",
-        )
-    else:
-        await update.message.reply_text(
-            f"✅ <b>Готово!</b>\n\n"
-            f"<pre>{escape_html(short)}</pre>\n\n"
-            f"Собрать APK: <code>/build_apk</code>",
-            parse_mode="HTML",
-        )
-
-    try:
-        await status.delete()
-    except Exception:
-        pass
-
-    loop_running = False
-    set_loop_state(False)
 
 
 async def cmd_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -735,7 +873,14 @@ async def cmd_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if loop_running:
         await update.message.reply_text("🚀 Уже работает.")
         return
-    asyncio.create_task(_autopilot_loop(update))
+
+    max_cycles = 0
+    if context.args:
+        try:
+            max_cycles = max(0, int(context.args[0]))
+        except ValueError:
+            pass
+    asyncio.create_task(_autopilot_loop(update, max_cycles))
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1075,6 +1220,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("effort", cmd_effort))
+    app.add_handler(CallbackQueryHandler(cb_effort, pattern=r"^eff:"))
     app.add_handler(CommandHandler("credits", cmd_credits))
     app.add_handler(CommandHandler("credits_limit", cmd_credits_limit))
     app.add_handler(CommandHandler("credits_reset", cmd_credits_reset))
