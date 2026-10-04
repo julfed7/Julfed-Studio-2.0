@@ -114,7 +114,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🎮 <b>Студия Cubism (Termux)</b>\n\n"
         "<b>Главное:</b>\n"
         "• <code>/direction &lt;цель&gt;</code> — задать цель\n"
-        "• <code>/autopilot [N]</code> — Codex сам придумывает и делает новые идеи под направление (N — макс. идей)\n"
+        "• <code>/autopilot [N]</code> — студия: планировщик придумывает идеи под направление, разбивает на задачи, модели из <code>/team</code> их делают (N — макс. идей)\n"
         "• <code>/build_apk</code> — собрать APK\n"
         "• <code>/stop</code> — остановить\n\n"
         "<b>Ручные задачи:</b>\n"
@@ -128,7 +128,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• .txt .md .gd → промпт\n"
         "• фото / видео → Codex\n"
         "• .zip → замена проекта\n\n"
-        "<b>Прочее:</b> <code>/model</code>, <code>/effort</code>, <code>/credits</code>, <code>/limit5h</code>, <code>/credits_limit</code>, <code>/credits_reset</code>, <code>/status</code>, <code>/cancel</code>"
+        "<b>Прочее:</b> <code>/model</code>, <code>/effort</code>, <code>/team</code>, <code>/credits</code>, <code>/limit5h</code>, <code>/credits_limit</code>, <code>/credits_reset</code>, <code>/status</code>, <code>/cancel</code>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -144,7 +144,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ============ МОДЕЛЬ ============
 
-DEFAULT_MODELS = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-luna", "gpt-6.1-sol"]
+DEFAULT_MODELS = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"]
 EFFORTS = ["low", "medium", "high", "xhigh", "ultra"]
 EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "ultra"]
 EFFORT_ALLOWED = set(EFFORT_ORDER)
@@ -664,12 +664,72 @@ async def cmd_loop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio.create_task(_loop_queue(update))
 
 
-# ============ АВТОПИЛОТ (ЦИКЛАМИ) ============
+# ============ СТУДИЯ: ПЛАНИРОВЩИК + КОМАНДА МОДЕЛЕЙ ============
 
 MAX_FAILS_IN_ROW = 3
-PAUSE_BETWEEN_CYCLES = 20  # секунд
+PAUSE_BETWEEN_IDEAS = 20  # секунд
+MAX_TASKS_PER_IDEA = 8
 IDEAS_FILE = Path(__file__).parent / "ideas_log.json"
 IDEAS_IN_PROMPT = 40
+
+ROLES = ["planner", "heavy", "mid", "light"]
+ROLE_DEFAULTS = {
+    "planner": ("gpt-6-luna", "medium"),
+    "heavy": ("gpt-6-astra", "high"),
+    "mid": ("gpt-6-luna", "medium"),
+    "light": ("gpt-5.6-luna", "low"),
+}
+ROLE_ICON = {"planner": "🧠", "heavy": "🔴", "mid": "🟡", "light": "🟢"}
+ROLE_TITLE = {
+    "planner": "Планировщик (идеи и разбивка)",
+    "heavy": "Сложные задачи (тайлмапы и т.п.)",
+    "mid": "Обычные задачи",
+    "light": "Простые задачи (персонажи, анимации)",
+}
+HEAVY_KEYWORDS = ("tilemap", "tileset", "tile", "тайл")
+
+
+def team_get(role: str):
+    from config import CONFIG
+    dm, de = ROLE_DEFAULTS[role]
+    return CONFIG.get(f"team_{role}_model", dm), CONFIG.get(f"team_{role}_effort", de)
+
+
+def _team_text() -> str:
+    lines = ["👥 <b>Команда студии</b>\n"]
+    for r in ROLES:
+        m, e = team_get(r)
+        lines.append(f"{ROLE_ICON[r]} <b>{r}</b> — <code>{m}</code> / <code>{e}</code>\n   <i>{ROLE_TITLE[r]}</i>")
+    lines.append(
+        "\nИзменить: <code>/team heavy gpt-6-astra high</code>\n"
+        "Роли: planner, heavy, mid, light"
+    )
+    return "\n".join(lines)
+
+
+async def cmd_team(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from config import CONFIG, save_config
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(_team_text(), parse_mode="HTML")
+        return
+    role = args[0].lower()
+    if role not in ROLES or len(args) < 2:
+        await update.message.reply_text("❌ Формат: /team <planner|heavy|mid|light> <модель> [усилие]")
+        return
+    model = args[1]
+    CONFIG[f"team_{role}_model"] = model
+    if len(args) >= 3:
+        eff = args[2].lower()
+        if eff not in EFFORT_ALLOWED:
+            await update.message.reply_text("❌ Усилие: " + ", ".join(EFFORT_ORDER))
+            return
+        CONFIG[f"team_{role}_effort"] = eff
+    models = CONFIG.setdefault("models", list(DEFAULT_MODELS))
+    if model not in models:
+        models.append(model)
+    save_config(CONFIG)
+    await update.message.reply_text(_team_text(), parse_mode="HTML")
 
 
 def _load_ideas() -> list:
@@ -690,31 +750,106 @@ def _save_idea(title: str) -> None:
         pass
 
 
-def _extract_idea(answer: str) -> str:
-    m = re.findall(r"^\s*IDEA:\s*(.+)$", answer or "", flags=re.MULTILINE)
-    if m:
-        return m[-1].strip()[:120]
-    first = (answer or "").strip().splitlines()[0] if (answer or "").strip() else "без названия"
-    return first[:120]
-
-
-def _build_cycle_prompt(direction: str, cycle: int) -> str:
+def _build_planner_prompt(direction: str, idea_no: int) -> str:
     done = [i["idea"] for i in _load_ideas()[-IDEAS_IN_PROMPT:]]
     done_txt = "\n".join(f"- {t}" for t in done) if done else "(пока ничего)"
-    return f"""Ты геймдизайнер и разработчик Godot-проекта в текущей папке. Это итерация №{cycle} автопилота.
+    return f"""Ты ведущий геймдизайнер и технический директор студии, которая делает Godot-игру в текущей папке. Это идея №{idea_no}.
 
 НАПРАВЛЕНИЕ ИГРЫ:
 {direction}
 
-УЖЕ РЕАЛИЗОВАННЫЕ ИДЕИ (не повторяй их, не делай похожие):
+УЖЕ РЕАЛИЗОВАННЫЕ ИДЕИ (не повторяй их и не делай похожие):
 {done_txt}
 
-ЗАДАЧА ИТЕРАЦИИ:
-1. Изучи текущее состояние проекта (project.godot, scenes/, scripts/, autoloads/), пойми, что в игре уже есть.
-2. Придумай ОДНУ новую, интересную и конкретную идею, которая усиливает игру в рамках направления. Это может быть новая механика, враг или предмет, способность, уровень, событие, система прогрессии, интерфейс, звук, эффект или баланс. Чередуй категории, не зацикливайся на одном типе.
-3. Реализуй идею полностью: сцены, скрипты, подключение к существующему коду. Недостающие ресурсы (спрайты, звуки) заменяй заглушками. Не спрашивай ничего, делай.
-4. Не ломай существующее. После изменений проект должен запускаться без ошибок парсинга в .gd и .tscn.
-5. В конце ответа напиши 2-4 строки о том, что сделано, а последней строкой: IDEA: <короткое название идеи, до 10 слов>"""
+ТВОЯ ЗАДАЧА, ТОЛЬКО ПЛАНИРОВАНИЕ. НЕ ИЗМЕНЯЙ И НЕ СОЗДАВАЙ НИКАКИЕ ФАЙЛЫ.
+1. Изучи проект (project.godot, scenes/, scripts/, autoloads/), пойми, что в игре уже есть.
+2. Придумай ОДНУ новую конкретную идею, которая усиливает игру в рамках направления (механика, персонаж, враг, предмет, способность, уровень, режим, событие, прогрессия, интерфейс, звук, баланс). Чередуй категории.
+3. Разбей идею на {2}-{MAX_TASKS_PER_IDEA} последовательных задач. Порядок важен: следующая задача может опираться на результат предыдущих.
+4. Каждой задаче назначь исполнителя:
+   - "heavy": самая сильная и дорогая модель. Для самого сложного: тайлмапы, тайлсеты и карты уровней, архитектура, сложные системы, ИИ врагов, хитрая математика.
+   - "mid": средняя модель. Обычные механики, сцены, интерфейс, интеграция частей.
+   - "light": дешёвая модель. Персонажи со спрайтами и анимациями (idle, walk, run, attack и т.д.), простые скрипты, заглушки ресурсов, звуки, мелкий баланс, тексты.
+   ПРАВИЛО: любая задача с тайлмапами, тайлсетами или построением карты уровня ВСЕГДА "heavy". Не назначай "heavy" без необходимости, это дорого.
+5. Описание каждой задачи должно быть самодостаточным: что сделать, какие файлы создать или изменить, как это связано с остальным.
+
+ОТВЕТ СТРОГО В ФОРМАТЕ JSON, без пояснений и без markdown:
+{{"idea": "короткое название идеи, до 10 слов", "summary": "1-2 предложения о сути идеи", "tasks": [{{"title": "короткое название задачи", "description": "подробное описание", "model": "heavy|mid|light"}}]}}"""
+
+
+def _parse_plan(text: str):
+    m = re.search(r"\{.*\}", text or "", flags=re.DOTALL)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return None
+    raw = data.get("tasks")
+    if not isinstance(raw, list) or not raw:
+        return None
+    tasks = []
+    for t in raw[:MAX_TASKS_PER_IDEA]:
+        if not isinstance(t, dict):
+            continue
+        title = str(t.get("title", "")).strip()[:100]
+        desc = str(t.get("description", "")).strip()
+        if not title or not desc:
+            continue
+        role = str(t.get("model", "mid")).strip().lower()
+        if role not in ("heavy", "mid", "light"):
+            role = "mid"
+        if any(k in (title + " " + desc).lower() for k in HEAVY_KEYWORDS):
+            role = "heavy"
+        tasks.append({"title": title, "description": desc, "role": role})
+    if not tasks:
+        return None
+    return {
+        "idea": str(data.get("idea", "без названия")).strip()[:120] or "без названия",
+        "summary": str(data.get("summary", "")).strip()[:400],
+        "tasks": tasks,
+    }
+
+
+def _plan_text(plan: dict, idea_no: int) -> str:
+    lines = [
+        f"💡 <b>Идея #{idea_no}: {escape_html(plan['idea'])}</b>",
+        f"<i>{escape_html(plan['summary'])}</i>\n",
+        "<b>План задач:</b>",
+    ]
+    for i, t in enumerate(plan["tasks"], 1):
+        m, _ = team_get(t["role"])
+        lines.append(
+            f"{i}. {ROLE_ICON[t['role']]} {escape_html(t['title'])} "
+            f"→ <code>{m}</code>"
+        )
+    lines.append("\n🔴 сложные  🟡 обычные  🟢 простые")
+    return "\n".join(lines)
+
+
+def _build_task_prompt(direction: str, plan: dict, index: int, statuses: list) -> str:
+    plan_lines = []
+    for i, t in enumerate(plan["tasks"]):
+        mark = "ГОТОВО" if statuses[i] == "ok" else ("ПРОПУЩЕНО" if statuses[i] == "fail" else ("← ТВОЯ ЗАДАЧА" if i == index else "впереди"))
+        plan_lines.append(f"{i + 1}. [{t['role']}] {t['title']} ({mark})")
+    t = plan["tasks"][index]
+    return f"""Ты разработчик Godot-проекта в текущей папке. Студия реализует идею «{plan['idea']}»: {plan['summary']}
+
+НАПРАВЛЕНИЕ ИГРЫ:
+{direction}
+
+ПЛАН ИДЕИ:
+{chr(10).join(plan_lines)}
+
+ТВОЯ ЗАДАЧА (№{index + 1} из {len(plan['tasks'])}): {t['title']}
+{t['description']}
+
+ПРАВИЛА:
+- Делай только свою задачу, остальные пункты плана сделают другие.
+- Сначала посмотри, что уже есть в проекте (в том числе результат предыдущих задач), и опирайся на это.
+- Соблюдай ограничения из направления игры (то, что нельзя удалять или менять).
+- Недостающие ресурсы (спрайты, звуки) заменяй заглушками. Ничего не спрашивай, делай.
+- После изменений проект должен запускаться без ошибок парсинга в .gd и .tscn.
+- В конце ответа напиши 2-4 строки: что сделано и какие файлы затронуты."""
 
 
 async def _wait_for_5h_reset(update: Update) -> bool:
@@ -735,7 +870,41 @@ async def _wait_for_5h_reset(update: Update) -> bool:
     return False
 
 
-async def _autopilot_loop(update: Update, max_cycles: int = 0) -> None:
+async def _run_with_progress(update: Update, label: str, prompt: str, model: str, effort: str):
+    """Запускает Codex в потоке, обновляет статус раз в минуту. None, если остановили."""
+    global loop_running
+    status = await update.message.reply_text(
+        f"⏳ {escape_html(label)}\n<code>{model}</code> / <code>{effort}</code>, 0 мин",
+        parse_mode="HTML",
+    )
+    task = asyncio.create_task(asyncio.to_thread(run_codex, prompt, None, model, effort))
+    elapsed = 0
+    while not task.done() and loop_running:
+        await asyncio.sleep(30)
+        if task.done():
+            break
+        elapsed += 0.5
+        if elapsed == int(elapsed):
+            try:
+                await status.edit_text(
+                    f"⏳ {escape_html(label)}\n<code>{model}</code> / <code>{effort}</code>, {int(elapsed)} мин",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    if not loop_running and not task.done():
+        return None
+    try:
+        return task.result()
+    except Exception as e:
+        return {"ok": False, "answer": str(e), "tokens": 0}
+
+
+async def _autopilot_loop(update: Update, max_ideas: int = 0) -> None:
     global loop_running
     direction = get_direction()
     if not direction:
@@ -747,110 +916,160 @@ async def _autopilot_loop(update: Update, max_cycles: int = 0) -> None:
     loop_running = True
     set_loop_state(True)
 
-    limit_txt = f"Максимум проходов: {max_cycles}\n" if max_cycles else "Идеи идут бесконечно, пока не нажмёшь /stop\n"
+    limit_txt = f"Максимум идей: {max_ideas}\n" if max_ideas else "Идеи идут бесконечно, пока не нажмёшь /stop\n"
     await update.message.reply_text(
-        f"🚀 <b>Автопилот запущен (циклами)</b>\n\n"
+        f"🚀 <b>Студия запущена</b>\n\n"
         f"🎯 <i>{escape_html(direction[:300])}</i>\n\n"
-        f"{limit_txt}"
-        f"Каждый проход: Codex придумывает новую идею под направление, реализует её, коммит и пуш, затем следующая идея.\n"
-        f"Собрать APK: /build_apk\n"
+        f"{limit_txt}\n"
+        f"{_team_text()}\n\n"
+        f"Планировщик придумывает идею и разбивает её на задачи, "
+        f"каждую задачу делает назначенная модель. После идеи: коммит и пуш.\n"
         f"Остановить: /stop",
         parse_mode="HTML",
     )
 
-    cycle = 0
+    idea_no = len(_load_ideas())
+    ideas_this_run = 0
     fails = 0
     reason = ""
 
     try:
         while loop_running:
-            if max_cycles and cycle >= max_cycles:
-                reason = f"выполнено {cycle} проходов"
+            if max_ideas and ideas_this_run >= max_ideas:
+                reason = f"сделано идей: {ideas_this_run}"
                 break
             if not await _wait_for_5h_reset(update):
                 break
 
-            cycle += 1
-            prompt = _build_cycle_prompt(direction, cycle)
-            status = await update.message.reply_text(
-                f"🧠 <b>Проход #{cycle}</b>: Codex работает...\n<i>0 мин</i>",
-                parse_mode="HTML",
-            )
-            task = asyncio.create_task(asyncio.to_thread(run_codex, prompt, None))
+            idea_no += 1
+            idea_tokens = 0
 
-            elapsed = 0
-            while not task.done() and loop_running:
-                await asyncio.sleep(60)
-                elapsed += 1
-                try:
-                    await status.edit_text(
-                        f"🧠 <b>Проход #{cycle}</b>: Codex работает...\n<i>{elapsed} мин</i>",
+            # ---- 1. планирование ----
+            pm, pe = team_get("planner")
+            res = await _run_with_progress(
+                update, f"Идея #{idea_no}: планировщик придумывает идею и задачи",
+                _build_planner_prompt(direction, idea_no), pm, pe,
+            )
+            if res is None:
+                reason = "остановлено пользователем"
+                break
+            idea_tokens += res.get("tokens", 0) or 0
+            plan = _parse_plan(res.get("answer", "")) if res.get("ok") else None
+            if not plan:
+                fails += 1
+                detail = (res.get("answer", "") or "")[:300]
+                await update.message.reply_text(
+                    f"❌ Планировщик не выдал рабочий план ({fails}/{MAX_FAILS_IN_ROW})\n"
+                    f"<pre>{escape_html(detail)}</pre>",
+                    parse_mode="HTML",
+                )
+                idea_no -= 1
+                if fails >= MAX_FAILS_IN_ROW:
+                    reason = f"{MAX_FAILS_IN_ROW} сбоя планировщика подряд"
+                    break
+                await asyncio.sleep(PAUSE_BETWEEN_IDEAS)
+                continue
+
+            await update.message.reply_text(_plan_text(plan, idea_no), parse_mode="HTML")
+
+            # ---- 2. исполнение задач ----
+            statuses = ["pending"] * len(plan["tasks"])
+            stopped = False
+            for i, t in enumerate(plan["tasks"]):
+                if not loop_running:
+                    stopped = True
+                    break
+                if not await _wait_for_5h_reset(update):
+                    stopped = True
+                    break
+                model, effort = team_get(t["role"])
+                prompt = _build_task_prompt(direction, plan, i, statuses)
+                label = f"Задача {i + 1}/{len(plan['tasks'])}: {t['title']}"
+
+                result = None
+                for attempt in (1, 2):
+                    result = await _run_with_progress(update, label, prompt, model, effort)
+                    if result is None:
+                        break
+                    idea_tokens += result.get("tokens", 0) or 0
+                    if result.get("ok"):
+                        break
+                    if attempt == 1:
+                        await update.message.reply_text(
+                            f"⚠️ {escape_html(t['title'])}: ошибка, пробую ещё раз"
+                        )
+                if result is None:
+                    stopped = True
+                    break
+
+                if result.get("ok"):
+                    statuses[i] = "ok"
+                    out = (result.get("answer", "") or "").strip()
+                    await update.message.reply_text(
+                        f"✅ <b>{i + 1}/{len(plan['tasks'])} {escape_html(t['title'])}</b> "
+                        f"{ROLE_ICON[t['role']]} <code>{model}</code>\n"
+                        f"<pre>{escape_html(out[:500])}</pre>",
                         parse_mode="HTML",
                     )
-                except Exception:
-                    pass
+                else:
+                    statuses[i] = "fail"
+                    await update.message.reply_text(
+                        f"❌ <b>{i + 1}/{len(plan['tasks'])} {escape_html(t['title'])}</b> пропущена\n"
+                        f"<pre>{escape_html((result.get('answer', '') or '')[:300])}</pre>",
+                        parse_mode="HTML",
+                    )
 
-            if not loop_running:
+            if stopped:
                 reason = "остановлено пользователем"
                 break
 
-            try:
-                result = task.result()
-            except Exception as e:
-                result = {"ok": False, "answer": str(e)}
-
-            try:
-                await status.delete()
-            except Exception:
-                pass
-
-            if not result or not result.get("ok"):
+            ok_count = statuses.count("ok")
+            if ok_count == 0:
                 fails += 1
-                answer = (result.get("answer", "?") if result else "пусто")[:400]
                 await update.message.reply_text(
-                    f"❌ Проход #{cycle} упал ({fails}/{MAX_FAILS_IN_ROW}):\n"
-                    f"<pre>{escape_html(answer)}</pre>",
-                    parse_mode="HTML",
+                    f"❌ Идея #{idea_no}: ни одна задача не выполнена ({fails}/{MAX_FAILS_IN_ROW})"
                 )
                 if fails >= MAX_FAILS_IN_ROW:
-                    reason = f"{MAX_FAILS_IN_ROW} ошибки подряд"
+                    reason = f"{MAX_FAILS_IN_ROW} неудачные идеи подряд"
                     break
-                await asyncio.sleep(PAUSE_BETWEEN_CYCLES)
+                await asyncio.sleep(PAUSE_BETWEEN_IDEAS)
                 continue
-
             fails = 0
-            answer = result.get("answer", "") or ""
-            idea = _extract_idea(answer)
-            clean = re.sub(r"^\s*IDEA:.*$", "", answer, flags=re.MULTILINE).strip()
 
+            # ---- 3. коммит и пуш ----
             ok, git_out = await asyncio.to_thread(
-                git_commit_push, f"[auto] идея #{cycle}: {idea[:60]}"
+                git_commit_push, f"[auto] идея #{idea_no}: {plan['idea'][:60]}"
             )
             if not ok:
                 await update.message.reply_text(
-                    f"❌ <b>Git НЕ прошёл</b> (проход #{cycle})\n"
+                    f"❌ <b>Git НЕ прошёл</b> (идея #{idea_no})\n"
                     f"<pre>{escape_html(git_out[-400:])}</pre>",
                     parse_mode="HTML",
                 )
                 reason = "ошибка git, остановил, чтобы не копить непушенные правки"
                 break
 
-            _save_idea(idea)
+            _save_idea(plan["idea"])
+            ideas_this_run += 1
+            u = get_usage_summary()
+            pct = f" ({idea_tokens / u['w5_limit'] * 100:.1f}% от 5ч лимита)" if u["w5_limit"] > 0 and idea_tokens else ""
+            skipped = statuses.count("fail")
             await update.message.reply_text(
-                f"💡 <b>Идея #{cycle}: {escape_html(idea)}</b>\n"
-                f"✅ Реализована и запушена\n\n"
-                f"<pre>{escape_html(clean[:600])}</pre>",
+                f"🎉 <b>Идея #{idea_no} готова и запушена</b>: {escape_html(plan['idea'])}\n"
+                f"Задач выполнено: {ok_count}/{len(statuses)}"
+                f"{f', пропущено: {skipped}' if skipped else ''}\n"
+                f"Токенов на идею: {idea_tokens:,}{pct}".replace(",", " "),
                 parse_mode="HTML",
             )
 
-            await asyncio.sleep(PAUSE_BETWEEN_CYCLES)
+            await asyncio.sleep(PAUSE_BETWEEN_IDEAS)
     finally:
         loop_running = False
         set_loop_state(False)
 
     await update.message.reply_text(
-        f"🏁 <b>Автопилот завершён</b>: {reason or 'остановлен'}\n"
-        f"Проходов: {cycle}\n\nСобрать APK: <code>/build_apk</code>",
+        f"🏁 <b>Студия остановлена</b>: {reason or 'остановлена'}\n"
+        f"Идей за этот запуск: {ideas_this_run}\n\nСобрать APK: <code>/build_apk</code>",
         parse_mode="HTML",
     )
 
@@ -1221,6 +1440,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("effort", cmd_effort))
+    app.add_handler(CommandHandler("team", cmd_team))
     app.add_handler(CallbackQueryHandler(cb_effort, pattern=r"^eff:"))
     app.add_handler(CommandHandler("credits", cmd_credits))
     app.add_handler(CommandHandler("credits_limit", cmd_credits_limit))

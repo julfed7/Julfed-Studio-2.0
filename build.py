@@ -681,9 +681,9 @@ def get_codex_limits() -> dict:
 
 
 
-def _run_codex(prompt: str, image_paths: list = None) -> dict:
-    model = CONFIG.get("model", "gpt-5.6-luna")
-    effort = CONFIG.get("effort", "high")
+def _run_codex(prompt: str, image_paths: list = None, model: str = None, effort: str = None) -> dict:
+    model = model or CONFIG.get("model", "gpt-5.6-luna")
+    effort = effort or CONFIG.get("effort", "high")
 
     cmd = [
         CODEX_PATH, "exec",
@@ -727,8 +727,8 @@ def _run_codex(prompt: str, image_paths: list = None) -> dict:
     }
 
 
-def run_codex(prompt: str, image_paths: list = None) -> dict:
-    return _run_codex(prompt, image_paths)
+def run_codex(prompt: str, image_paths: list = None, model: str = None, effort: str = None) -> dict:
+    return _run_codex(prompt, image_paths, model, effort)
 
 
 def run_codex_only(prompt: str, image_paths: list = None) -> dict:
