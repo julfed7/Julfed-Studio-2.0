@@ -144,7 +144,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ============ МОДЕЛЬ ============
 
-DEFAULT_MODELS = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"]
+DEFAULT_MODELS = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"]
 EFFORTS = ["low", "medium", "high", "xhigh", "ultra"]
 EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "ultra"]
 EFFORT_ALLOWED = set(EFFORT_ORDER)
@@ -672,21 +672,26 @@ MAX_TASKS_PER_IDEA = 8
 IDEAS_FILE = Path(__file__).parent / "ideas_log.json"
 IDEAS_IN_PROMPT = 40
 
-ROLES = ["planner", "heavy", "mid", "light"]
+ROLES = ["planner", "heavy", "mid", "light", "checker"]
 ROLE_DEFAULTS = {
     "planner": ("gpt-6-luna", "medium"),
     "heavy": ("gpt-6-astra", "high"),
-    "mid": ("gpt-6-luna", "medium"),
-    "light": ("gpt-5.6-luna", "low"),
+    "mid": ("gpt-6.1-sol", "medium"),
+    "light": ("gpt-5.6-terra", "low"),
+    "checker": ("gpt-5.6-terra", "low"),
 }
-ROLE_ICON = {"planner": "🧠", "heavy": "🔴", "mid": "🟡", "light": "🟢"}
+ROLE_ICON = {"planner": "🧠", "heavy": "🔴", "mid": "🟡", "light": "🟢", "checker": "🛡"}
 ROLE_TITLE = {
     "planner": "Планировщик (идеи и разбивка)",
-    "heavy": "Сложные задачи (тайлмапы и т.п.)",
-    "mid": "Обычные задачи",
+    "heavy": "Тайлмапы и расстановка объектов в сценах (дорогая)",
+    "mid": "Основные задачи (сильная, медленная, дешевле heavy)",
     "light": "Простые задачи (персонажи, анимации)",
+    "checker": "Контролёр: проверка и починка проекта перед пушем",
 }
-HEAVY_KEYWORDS = ("tilemap", "tileset", "tile", "тайл")
+HEAVY_KEYWORDS = (
+    "tilemap", "tileset", "tile", "тайл",
+    "расстанов", "расстав", "компоновк", "level design", "левел-дизайн", "level layout",
+)
 
 
 def team_get(role: str):
@@ -702,7 +707,7 @@ def _team_text() -> str:
         lines.append(f"{ROLE_ICON[r]} <b>{r}</b> — <code>{m}</code> / <code>{e}</code>\n   <i>{ROLE_TITLE[r]}</i>")
     lines.append(
         "\nИзменить: <code>/team heavy gpt-6-astra high</code>\n"
-        "Роли: planner, heavy, mid, light"
+        "Роли: planner, heavy, mid, light, checker"
     )
     return "\n".join(lines)
 
@@ -715,7 +720,7 @@ async def cmd_team(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     role = args[0].lower()
     if role not in ROLES or len(args) < 2:
-        await update.message.reply_text("❌ Формат: /team <planner|heavy|mid|light> <модель> [усилие]")
+        await update.message.reply_text("❌ Формат: /team <planner|heavy|mid|light|checker> <модель> [усилие]")
         return
     model = args[1]
     CONFIG[f"team_{role}_model"] = model
@@ -766,10 +771,10 @@ def _build_planner_prompt(direction: str, idea_no: int) -> str:
 2. Придумай ОДНУ новую конкретную идею, которая усиливает игру в рамках направления (механика, персонаж, враг, предмет, способность, уровень, режим, событие, прогрессия, интерфейс, звук, баланс). Чередуй категории.
 3. Разбей идею на {2}-{MAX_TASKS_PER_IDEA} последовательных задач. Порядок важен: следующая задача может опираться на результат предыдущих.
 4. Каждой задаче назначь исполнителя:
-   - "heavy": самая сильная и дорогая модель. Для самого сложного: тайлмапы, тайлсеты и карты уровней, архитектура, сложные системы, ИИ врагов, хитрая математика.
-   - "mid": средняя модель. Обычные механики, сцены, интерфейс, интеграция частей.
-   - "light": дешёвая модель. Персонажи со спрайтами и анимациями (idle, walk, run, attack и т.д.), простые скрипты, заглушки ресурсов, звуки, мелкий баланс, тексты.
-   ПРАВИЛО: любая задача с тайлмапами, тайлсетами или построением карты уровня ВСЕГДА "heavy". Не назначай "heavy" без необходимости, это дорого.
+   - "heavy": самая дорогая модель. Назначай ТОЛЬКО для: (а) тайлмапов, тайлсетов и карт уровней; (б) сборки и компоновки сцен, то есть расстановки объектов на уровне и в сцене (позиции, слои, спавны, препятствия, кусты, стены, ящики, точки появления); (в) критически сложных мест, где дешёвые модели ошибаются. Не трать её на остальное.
+   - "mid": сильная, но медленная и заметно дешевле heavy. Основная рабочая лошадка: все нетривиальные задачи, архитектура систем, ИИ врагов, механики боя, сцены, интерфейс и меню, интеграция частей, режимы. Если сомневаешься между heavy и mid, выбирай mid.
+   - "light": самая дешёвая и быстрая модель. Персонажи со спрайтами и анимациями (idle, walk, run, attack, hit, death), простые скрипты, заглушки ресурсов, звуки, мелкий баланс, тексты.
+   ПРАВИЛО: любая задача с тайлмапами, тайлсетами, построением карты уровня или расстановкой объектов в сцене ВСЕГДА "heavy". Код механик и логики объектов (скрипты) при этом остаётся у "mid". Не назначай "heavy" без необходимости, это дорого.
 5. Описание каждой задачи должно быть самодостаточным: что сделать, какие файлы создать или изменить, как это связано с остальным.
 
 ОТВЕТ СТРОГО В ФОРМАТЕ JSON, без пояснений и без markdown:
@@ -824,6 +829,26 @@ def _plan_text(plan: dict, idea_no: int) -> str:
         )
     lines.append("\n🔴 сложные  🟡 обычные  🟢 простые")
     return "\n".join(lines)
+
+
+def _build_checker_prompt(direction: str, plan: dict, statuses: list) -> str:
+    done = "\n".join(
+        f"- {t['title']}" for t, s in zip(plan["tasks"], statuses) if s == "ok"
+    )
+    return f"""Ты контролёр качества Godot-проекта в текущей папке. Студия только что реализовала идею «{plan['idea']}».
+
+СДЕЛАННЫЕ ЗАДАЧИ:
+{done}
+
+НАПРАВЛЕНИЕ ИГРЫ (его ограничения нарушать нельзя):
+{direction}
+
+ТВОЯ ЗАДАЧА, ПРОВЕРКА И МИНИМАЛЬНАЯ ПОЧИНКА:
+1. Проверь файлы, изменённые в этой идее (.gd, .tscn, .tres, project.godot): синтаксис GDScript, корректность структуры .tscn и .tres, незакрытые скобки, неверные отступы.
+2. Проверь ссылки: все пути res:// существуют, скрипты подключены к существующим узлам, сигналы и autoload-ы существуют, главная сцена указана верно.
+3. Если в системе есть godot, запусти headless-проверку проекта, иначе проверяй вручную.
+4. Исправляй только найденные поломки, минимальными правками. Не добавляй новые функции и не меняй дизайн. Не удаляй то, что запрещено направлением (например, режимы игры).
+5. В конце ответа: список найденных и исправленных проблем (1-6 строк) или «проблем не найдено»."""
 
 
 def _build_task_prompt(direction: str, plan: dict, index: int, statuses: list) -> str:
@@ -923,7 +948,7 @@ async def _autopilot_loop(update: Update, max_ideas: int = 0) -> None:
         f"{limit_txt}\n"
         f"{_team_text()}\n\n"
         f"Планировщик придумывает идею и разбивает её на задачи, "
-        f"каждую задачу делает назначенная модель. После идеи: коммит и пуш.\n"
+        f"каждую задачу делает назначенная модель. Потом контролёр проверяет проект, затем коммит и пуш.\n"
         f"Остановить: /stop",
         parse_mode="HTML",
     )
@@ -988,15 +1013,23 @@ async def _autopilot_loop(update: Update, max_ideas: int = 0) -> None:
 
                 result = None
                 for attempt in (1, 2):
-                    result = await _run_with_progress(update, label, prompt, model, effort)
+                    run_model, run_effort = model, effort
+                    if attempt == 2:
+                        up = {"light": "mid", "mid": "heavy"}.get(t["role"])
+                        if up:
+                            run_model, run_effort = team_get(up)
+                    result = await _run_with_progress(update, label, prompt, run_model, run_effort)
                     if result is None:
                         break
                     idea_tokens += result.get("tokens", 0) or 0
                     if result.get("ok"):
+                        model = run_model
                         break
                     if attempt == 1:
+                        up_model = team_get({"light": "mid", "mid": "heavy"}.get(t["role"], t["role"]))[0]
                         await update.message.reply_text(
-                            f"⚠️ {escape_html(t['title'])}: ошибка, пробую ещё раз"
+                            f"⚠️ {escape_html(t['title'])}: ошибка, пробую ещё раз на <code>{up_model}</code>",
+                            parse_mode="HTML",
                         )
                 if result is None:
                     stopped = True
@@ -1035,6 +1068,30 @@ async def _autopilot_loop(update: Update, max_ideas: int = 0) -> None:
                 await asyncio.sleep(PAUSE_BETWEEN_IDEAS)
                 continue
             fails = 0
+
+            # ---- 2.5 контролёр ----
+            if loop_running:
+                cm, ce = team_get("checker")
+                cres = await _run_with_progress(
+                    update, f"Идея #{idea_no}: контролёр проверяет проект",
+                    _build_checker_prompt(direction, plan, statuses), cm, ce,
+                )
+                if cres is None:
+                    reason = "остановлено пользователем"
+                    break
+                idea_tokens += cres.get("tokens", 0) or 0
+                if cres.get("ok"):
+                    await update.message.reply_text(
+                        f"🛡 <b>Контролёр</b> <code>{cm}</code>\n"
+                        f"<pre>{escape_html((cres.get('answer', '') or '').strip()[:500])}</pre>",
+                        parse_mode="HTML",
+                    )
+                else:
+                    await update.message.reply_text(
+                        "🛡 Контролёр не отработал (ошибка), пушу как есть:\n"
+                        f"<pre>{escape_html((cres.get('answer', '') or '')[:200])}</pre>",
+                        parse_mode="HTML",
+                    )
 
             # ---- 3. коммит и пуш ----
             ok, git_out = await asyncio.to_thread(
