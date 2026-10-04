@@ -1192,7 +1192,7 @@ async def cmd_build_apk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     apk_path = Path(tempfile.gettempdir()) / f"build_{new_tag}.apk"
-    got = await asyncio.to_thread(download_latest_apk, GITHUB_REPO, GITHUB_TOKEN, apk_path)
+    got = await asyncio.to_thread(download_latest_apk, GITHUB_REPO, GITHUB_TOKEN, apk_path, new_tag)
     if not got:
         await status.edit_text(f"⚠️ Релиз {new_tag} есть, но APK не скачался.")
         return

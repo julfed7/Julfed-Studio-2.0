@@ -216,18 +216,46 @@ def _apk_asset(release: dict):
     return None
 
 
-def _latest_releases(repo: str, token: str) -> list:
+def _build_number(tag: str) -> int:
+    nums = re.findall(r"\d+", tag or "")
+    return int(nums[-1]) if nums else -1
+
+
+def _parse_gh_time(value: str) -> float:
     try:
-        data = _gh_request(f"https://api.github.com/repos/{repo}/releases?per_page=10", token)
-        return data if isinstance(data, list) else []
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=__import__("datetime").timezone.utc
+        ).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _release_key(rel: dict):
+    return (
+        _build_number(rel.get("tag_name", "")),
+        _parse_gh_time(rel.get("published_at") or rel.get("created_at") or ""),
+    )
+
+
+def _latest_releases(repo: str, token: str) -> list:
+    """Релизы от новых к старым: по номеру сборки в теге, потом по дате публикации.
+    Порядок GitHub API не используем: он может быть неверным."""
+    try:
+        data = _gh_request(f"https://api.github.com/repos/{repo}/releases?per_page=100", token)
+        releases = [r for r in data if isinstance(r, dict) and not r.get("draft")] if isinstance(data, list) else []
+        return sorted(releases, key=_release_key, reverse=True)
     except Exception as e:
         log(f"[GH] не удалось получить релизы: {e}")
         return []
 
 
-def download_latest_apk(repo: str, token: str, out_path: Path) -> bool:
+def download_latest_apk(repo: str, token: str, out_path: Path, tag: str = None) -> bool:
     try:
         releases = _latest_releases(repo, token)
+        if tag:
+            releases = [r for r in releases if r.get("tag_name") == tag] + [
+                r for r in releases if r.get("tag_name") != tag
+            ]
         for rel in releases:
             asset = _apk_asset(rel)
             if not asset:
@@ -237,6 +265,7 @@ def download_latest_apk(repo: str, token: str, out_path: Path) -> bool:
             req.add_header("Accept", "application/octet-stream")
             with urllib.request.urlopen(req, timeout=300) as resp:
                 out_path.write_bytes(resp.read())
+            log(f"[GH] скачан APK из релиза {rel.get('tag_name')}")
             return True
         log("[GH] ни в одном релизе нет .apk")
         return False
@@ -250,26 +279,17 @@ def get_latest_release_tag(repo: str, token: str) -> str:
     return releases[0]["tag_name"] if releases else ""
 
 
-def _parse_gh_time(value: str) -> float:
-    try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=__import__("datetime").timezone.utc
-        ).timestamp()
-    except Exception:
-        return 0.0
-
-
 def wait_for_new_release(repo: str, token: str, prev_tag: str, timeout_sec: int = 900) -> str:
     start = time.time()
+    prev_num = _build_number(prev_tag)
     while time.time() - start < timeout_sec:
-        for rel in _latest_releases(repo, token):
-            if rel.get("draft"):
-                continue
+        for rel in _latest_releases(repo, token):  # от самого нового номера
             if not _apk_asset(rel):
                 continue
             tag = rel.get("tag_name", "")
-            published = _parse_gh_time(rel.get("published_at") or rel.get("created_at") or "")
-            if tag != prev_tag or published >= start - 120:
+            published = _release_key(rel)[1]
+            newer_num = _build_number(tag) > prev_num >= 0
+            if newer_num or tag != prev_tag or published >= start - 120:
                 log(f"[GH] найден релиз {tag} с APK")
                 return tag
         time.sleep(20)
