@@ -166,7 +166,3 @@ ANDROID_PRESET=Android
 Python · python-telegram-bot · python-dotenv · Codex CLI · Godot · GitHub Actions · Termux
 
 ---
-
-## 📄 Лицензия
-
-Добавь файл `LICENSE` на свой выбор (например, MIT).
